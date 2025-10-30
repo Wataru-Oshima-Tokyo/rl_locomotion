@@ -766,8 +766,8 @@ class LeggedEnv:
         self.actions = torch.zeros_like(self.actions)
         self.last_actions = torch.zeros_like(self.actions)
         if self.use_low_level_control:
-            self.prev_low_level_target = torch.zeros_like(self.actions)
-            self.low_level_filter_state = torch.zeros_like(self.actions)
+            self.prev_low_level_target = None
+            self.low_level_filter_state = None
         self.dof_pos = torch.zeros_like(self.actions)
         self.dof_vel = torch.zeros_like(self.actions)
         self.hip_pos = torch.zeros_like(self.hip_actions)
@@ -1722,9 +1722,6 @@ class LeggedEnv:
         # reset buffers
         self.actions[envs_idx] = 0.0
         self.last_actions[envs_idx] = 0.0
-        if self.use_low_level_control:
-            self.prev_low_level_target[envs_idx] = 0.0
-            self.low_level_filter_state[envs_idx] = 0.0
         self.action_delay_buffer[envs_idx] = 0.0
         self.last_dof_vel[envs_idx] = 0.0
         self.hip_pos[envs_idx] = 0.0
@@ -1754,6 +1751,8 @@ class LeggedEnv:
         if self.mean_reward_half_flag:
             self._randomize_rigids(envs_idx)
             self._randomize_controls(envs_idx)
+        if self.use_low_level_control:
+            self._reset_low_level_buffers(envs_idx)
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = (
@@ -1765,6 +1764,30 @@ class LeggedEnv:
         if self.env_cfg['send_timeouts']:
             self.extras['time_outs'] = self.time_out_buf
 
+
+    def _reset_low_level_buffers(self, envs_idx):
+        envs_idx = torch.as_tensor(envs_idx, device=self.device, dtype=torch.long)
+        if envs_idx.numel() == 0:
+            return
+
+        if self.prev_low_level_target is None:
+            self.prev_low_level_target = torch.zeros_like(self.actions)
+        else:
+            self.prev_low_level_target[envs_idx] = 0.0
+
+        if isinstance(self.motor_offsets, torch.Tensor):
+            motor_offsets = self.motor_offsets
+        else:
+            motor_offsets = torch.as_tensor(
+                self.motor_offsets, device=self.device, dtype=self.default_dof_pos.dtype
+            )
+
+        default_state = self.default_dof_pos.unsqueeze(0) + motor_offsets
+
+        if self.low_level_filter_state is None:
+            self.low_level_filter_state = default_state.clone()
+        else:
+            self.low_level_filter_state[envs_idx] = default_state[envs_idx]
 
 
     def sample_random_positions(self, envs_idx):

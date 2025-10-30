@@ -190,7 +190,7 @@ def get_cfgs():
         "episode_length_s": 20.0,
         "resampling_time_s": 4.0,
         "action_scale": 0.25,
-        "simulate_action_latency": True,
+        "simulate_action_latency": False,
         'send_timeouts': True,
         "clip_actions": 100.0,
         'control_freq': 50,
