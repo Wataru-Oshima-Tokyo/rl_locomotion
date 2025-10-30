@@ -86,7 +86,7 @@ def quaternion_from_euler_tensor(roll_deg, pitch_deg, yaw_deg):
     qw = cr * cp * cy + sr * sp * sy
 
     # Stack into (N,4)
-    return torch.stack([qx, qy, qz, qw], dim=-1)
+    return torch.stack([qw, qx, qy, qz], dim=-1)
 
 
 def get_height_at_xy(height_field, x, y, horizontal_scale, vertical_scale, center_x, center_y):
@@ -137,6 +137,19 @@ class LeggedEnv:
         self.dt = 1 / env_cfg['control_freq']
         self.sim_dt = self.dt / env_cfg['decimation']
         self.sim_substeps = 1
+        self.low_level_cfg = env_cfg.get("low_level_control", {})
+        self.use_low_level_control = self.low_level_cfg.get("enabled", False)
+        self.enable_first_order_hold = self.low_level_cfg.get("first_order_hold", True)
+        self.low_level_cutoff_hz = self.low_level_cfg.get("cutoff_freq_hz", 37.5)
+        self.low_level_max_vel = self.low_level_cfg.get("max_joint_velocity", None)
+        if self.low_level_max_vel is not None:
+            self.low_level_max_vel = float(self.low_level_max_vel)
+            if self.low_level_max_vel <= 0.0:
+                self.low_level_max_vel = None
+        self.low_level_alpha = None
+        self._foh_factors = None
+        if self.use_low_level_control:
+            self._initialize_low_level_control(env_cfg)
         self.mean_reward = 0
         self.max_episode_length_s = env_cfg['episode_length_s']
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
@@ -172,19 +185,19 @@ class LeggedEnv:
 
         self.component_dim_dict = None
         
-        if self.env_cfg["randomize_delay"]:
-            # 1️⃣ Define Delay Parameters
-            self.min_delay, self.max_delay = self.env_cfg["delay_range"]  # Delay range in seconds
-            self.max_delay_steps = int(self.max_delay / self.dt)  # Convert max delay to steps
+        # if self.env_cfg["randomize_delay"]:
+        # 1️⃣ Define Delay Parameters
+        self.min_delay, self.max_delay = self.env_cfg["delay_range"]  # Delay range in seconds
+        self.max_delay_steps = int(self.max_delay / self.dt)  # Convert max delay to steps
 
-            # 2️⃣ Initialize Delay Buffers
-            self.action_delay_buffer = torch.zeros(
-                (self.num_envs, self.num_actions, self.max_delay_steps + 1), device=self.device
-            )
-            self.motor_delay_steps = torch.randint(
-                int(self.min_delay / self.dt), self.max_delay_steps + 1,
-                (self.num_envs, self.num_actions), device=self.device
-            )
+        # 2️⃣ Initialize Delay Buffers
+        self.action_delay_buffer = torch.zeros(
+            (self.num_envs, self.num_actions, self.max_delay_steps + 1), device=self.device
+        )
+        self.motor_delay_steps = torch.randint(
+            int(self.min_delay / self.dt), self.max_delay_steps + 1,
+            (self.num_envs, self.num_actions), device=self.device
+        )
         # create scene
         self.mean_reward_threshold = self.command_cfg["mean_reward_threshold"]
         self.terrain_type = terrain_cfg["terrain_type"]
@@ -368,43 +381,25 @@ class LeggedEnv:
                 self.scene.add_entity(
                     gs.morphs.Plane(),
                 )
-                # self.scene.add_entity(
-                #     gs.morphs.URDF(file="urdf/plane/single_step.urdf", fixed=True),
-                # ) 
-
-                # Beam thickness in the URDF
-                t = 0.20
-
-                # Rings as (inner_radius_R, height_H). 2 m gap => R = 1, 3, 5, 7 (m)
-                rings = [
-                    (0.5, 0.10),  # 10 cm high
-                    (2.5, 0.17),  # 17 cm high
-                    (4.5, 0.25),  # 25 cm high
-                    (6.5, 0.30),  # 35 cm high
-                ]
-
-                # Slight lift to avoid initial interpenetration with the mesh
-                EPS = 0.02  # 2 cm
-
                 self.available_positions = []
 
                 # Center (on the ground)
-                self.available_positions.append((0.0, 0.0, 0.0 + EPS))
+                self.available_positions.append((0.0, 0.0, 0.0))
 
-                for R, H in rings:
-                    offset = R + t / 2.0     # beam center from origin
-                    z_top = H                # top surface (URDF set with origin at H/2)
-                    z_spawn = z_top + EPS
+                # for R, H in rings:
+                #     offset = R + t / 2.0     # beam center from origin
+                #     z_top = H                # top surface (URDF set with origin at H/2)
+                #     z_spawn = z_top + EPS
 
-                    # Cardinal points on the ring (x, y, z)
-                    self.available_positions.extend([
-                        ( 0.0,  offset, z_spawn),  # top beam center
-                        ( 0.0, -offset, z_spawn),  # bottom beam center
-                        ( offset,  0.0,  z_spawn), # right beam center
-                        (-offset,  0.0,  z_spawn), # left beam center
-                    ])
+                #     # Cardinal points on the ring (x, y, z)
+                #     self.available_positions.extend([
+                #         ( 0.0,  offset, 0.0),  # top beam center
+                #         ( 0.0, -offset, 0.0),  # bottom beam center
+                #         ( offset,  0.0,  0.0), # right beam center
+                #         (-offset,  0.0,  0.0), # left beam center
+                #     ])
             # self.random_pos = self.generate_positions()
-            self.available_positions.append((0.0, 0.0, 0.0))
+            # self.available_positions.append((0.0, 0.0, 0.0))
         self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=self.device)
         self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=self.device)
         self.inv_base_init_quat = inv_quat(self.base_init_quat)
@@ -629,6 +624,96 @@ class LeggedEnv:
 
 
 
+    def _initialize_low_level_control(self, env_cfg):
+        decimation = max(1, int(env_cfg.get("decimation", 1)))
+        if self.enable_first_order_hold:
+            self._foh_factors = torch.linspace(
+                1, decimation, steps=decimation, device=self.device, dtype=gs.tc_float
+            ) / decimation
+        else:
+            self._foh_factors = torch.ones(
+                decimation, device=self.device, dtype=gs.tc_float
+            )
+        cutoff = self.low_level_cutoff_hz
+        if cutoff is None or cutoff <= 0.0:
+            self.low_level_alpha = 1.0
+        else:
+            rc = 1.0 / (2.0 * math.pi * cutoff)
+            self.low_level_alpha = float(self.sim_dt / (rc + self.sim_dt))
+
+    def _apply_low_pass_filter(self, desired_action):
+        """
+        desired_action : (N, n_dof)   方策出力（通常は [-1,1] スケール）
+        戻り値         : (N, n_dof)   フィルタ後の方策出力
+        方式:
+        1) 行動 → 関節角目標 q_ref_des [rad] に変換
+        2) q_ref 空間でレート制限（max_joint_velocity [rad/s]）
+        3) q_ref 空間で一次IIRローパス（EMA）
+        4) 行動空間に戻す
+        """
+        if not self.use_low_level_control:
+            return desired_action
+
+        # 1) 行動 → 関節角目標 [rad]
+        #    action_scale はスカラー/配列のどちらでもOKにしてブロードキャスト
+        if torch.is_tensor(self.env_cfg['action_scale']):
+            action_scale = self.env_cfg['action_scale'].to(self.device, dtype=gs.tc_float)
+        else:
+            action_scale = torch.as_tensor(self.env_cfg['action_scale'], device=self.device, dtype=gs.tc_float)
+
+        # shape を (N, n_dof) に合わせてブロードキャスト
+        if action_scale.ndim == 0:
+            action_scale = action_scale.expand_as(desired_action)
+        elif action_scale.shape != desired_action.shape[-1:]:
+            # (n_dof,) → (N, n_dof)
+            action_scale = action_scale.unsqueeze(0).expand_as(desired_action)
+
+        q_ref_des = self.default_dof_pos + desired_action * action_scale + self.motor_offsets  # [rad]
+
+        # 2) フィルタ内部状態（q_ref [rad]）の初期化
+        if getattr(self, "low_level_filter_state", None) is None:
+            self.low_level_filter_state = q_ref_des.clone()
+            # 行動空間に戻して返す
+            return (self.low_level_filter_state - self.default_dof_pos - self.motor_offsets) / action_scale
+
+        # 3) レート制限：q_ref 空間で [rad/s] を [rad/step] に
+        if self.low_level_max_vel is not None and self.low_level_max_vel > 0.0:
+            # max_joint_velocity はスカラー/配列の両対応
+            v_max = torch.as_tensor(self.low_level_max_vel, device=self.device, dtype=gs.tc_float)
+            if v_max.ndim == 0:
+                v_max = v_max.expand_as(q_ref_des)
+            elif v_max.shape != q_ref_des.shape[-1:]:
+                v_max = v_max.unsqueeze(0).expand_as(q_ref_des)
+
+            dq_max = v_max * self.sim_dt  # [rad/step]
+            dq     = torch.clamp(q_ref_des - self.low_level_filter_state, min=-dq_max, max=dq_max)
+            q_limited = self.low_level_filter_state + dq
+        else:
+            q_limited = q_ref_des
+
+        # 4) 一次IIRローパス（EMA）：q_ref 空間
+        alpha = float(self.low_level_alpha)
+        if alpha >= 1.0:
+            self.low_level_filter_state.copy_(q_limited)
+        else:
+            self.low_level_filter_state.add_(alpha * (q_limited - self.low_level_filter_state))
+
+        # 5) 行動空間に戻す
+        action_filtered = (self.low_level_filter_state - self.default_dof_pos - self.motor_offsets) / action_scale
+        return action_filtered
+
+
+    def _apply_motor_torques(self, motor_actions):
+        self.torques = self._compute_torques(motor_actions)
+        if self.num_envs == 0:
+            torques = self.torques.squeeze()
+            self.robot.control_dofs_force(torques, self.motor_dofs)
+        else:
+            self.robot.control_dofs_force(self.torques, self.motor_dofs)
+        self.scene.step()
+        self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
+        self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
+
     def init_buffers(self):
         self.base_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
@@ -680,6 +765,9 @@ class LeggedEnv:
         print("noise scale vector: ", self.noise_scale_vec)
         self.actions = torch.zeros_like(self.actions)
         self.last_actions = torch.zeros_like(self.actions)
+        if self.use_low_level_control:
+            self.prev_low_level_target = torch.zeros_like(self.actions)
+            self.low_level_filter_state = torch.zeros_like(self.actions)
         self.dof_pos = torch.zeros_like(self.actions)
         self.dof_vel = torch.zeros_like(self.actions)
         self.hip_pos = torch.zeros_like(self.hip_actions)
@@ -1186,31 +1274,44 @@ class LeggedEnv:
             # Gather from last dimension
             delayed_actions = self.action_delay_buffer.gather(dim=2, index=gather_indices).squeeze(-1)
 
-            exec_actions = delayed_actions
+            commanded_actions = delayed_actions
         else:
-            exec_actions = self.last_actions if self.simulate_action_latency else self.actions
-        dof_pos_list = []
-        dof_vel_list = []
-        
-        for i in range(self.env_cfg['decimation']):
-            self.torques = self._compute_torques(exec_actions)
-            if self.num_envs == 0:
-                torques = self.torques.squeeze()
-                self.robot.control_dofs_force(torques, self.motor_dofs)
-            else:
-                self.robot.control_dofs_force(self.torques, self.motor_dofs)
-            self.scene.step()
-            self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
-            self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
+            commanded_actions = self.last_actions if self.simulate_action_latency else self.actions
+
+        decimation = max(1, int(self.env_cfg['decimation']))
+        if self.use_low_level_control:
+            prev_target = getattr(self, "prev_low_level_target", None)
+            if prev_target is None:
+                prev_target = torch.zeros_like(commanded_actions)
+                self.prev_low_level_target = prev_target
+            action_delta = commanded_actions - prev_target
+            for substep_idx in range(decimation):
+                if self.enable_first_order_hold and decimation > 1:
+                    ratio = self._foh_factors[substep_idx]
+                    hold_action = prev_target + ratio * action_delta
+                else:
+                    hold_action = commanded_actions
+                filtered_action = self._apply_low_pass_filter(hold_action)
+                self._apply_motor_torques(filtered_action)
+            self.prev_low_level_target = commanded_actions.clone()
+        else:
+            for _ in range(decimation):
+                self._apply_motor_torques(commanded_actions)
 
 
 
 
-        
+
 
         pos_after_step = self.robot.get_pos()
         quat_after_step = self.robot.get_quat()
-
+        # base_height = pos_after_step[:, 2]      # (N,)
+        # base_height_vals = base_height.detach().cpu().flatten().tolist()
+        # if len(base_height_vals) == 1:
+        #     print(f"Base height: {base_height_vals[0]:.4f} [m]")
+        # else:
+        #     heights_str = ", ".join(f"{val:.4f}" for val in base_height_vals)
+        #     print(f"Base heights: [{heights_str}] [m]")
         # update buffers
         self.episode_length_buf += 1
         self.base_pos[:] = self.robot.get_pos()
@@ -1621,6 +1722,9 @@ class LeggedEnv:
         # reset buffers
         self.actions[envs_idx] = 0.0
         self.last_actions[envs_idx] = 0.0
+        if self.use_low_level_control:
+            self.prev_low_level_target[envs_idx] = 0.0
+            self.low_level_filter_state[envs_idx] = 0.0
         self.action_delay_buffer[envs_idx] = 0.0
         self.last_dof_vel[envs_idx] = 0.0
         self.hip_pos[envs_idx] = 0.0
@@ -1771,6 +1875,8 @@ class LeggedEnv:
             return None
 
     def start_recording(self, record_internal=True):
+        if self.show_camera_:
+            return
         self._recorded_frames = []
         self._recording = True
         if record_internal:

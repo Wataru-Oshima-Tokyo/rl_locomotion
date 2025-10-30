@@ -103,6 +103,23 @@ def get_cfgs():
             "neck_pitch_joint": 0.0,
             "neck_yaw_joint": 0.0,
         },
+        # "default_joint_angles": {  # [rad]
+        #     "left_hip_yaw_joint": 0.0,
+        #     "right_hip_yaw_joint": 0.0,
+        #     "left_hip_roll_joint": -0.1,
+        #     "right_hip_roll_joint": 0.1,
+        #     "left_hip_pitch_joint": 0.4,
+        #     "right_hip_pitch_joint": -0.4,
+
+        #     "left_knee_joint": -0.8,
+        #     "right_knee_joint": 0.8,
+
+        #     "left_ankle_joint": 0.4,
+        #     "right_ankle_joint": -0.4,
+
+        #     "neck_pitch_joint": 0.0,
+        #     "neck_yaw_joint": 0.0,
+        # },
         "dof_names": [ #order matters!
             "left_hip_yaw_joint",
             "left_hip_roll_joint",
@@ -118,13 +135,13 @@ def get_cfgs():
             "neck_yaw_joint",
         ],
         "dof_lower_limit": [ #order matters!
-            -0.2, -0.35, -2.3, -0.8, -0.8, #Left (hip_yaw, hip_roll, hip_pitch, knee, ankle)
-            -0.3, -0.25, -1.5, -2.5, -1.0, #Right (hip_yaw, hip_roll, hip_pitch, knee, ankle)
+            -0.3, -0.35, -2.3, -0.8, -0.8, #Left (hip_yaw, hip_roll, hip_pitch, knee, ankle)
+            -0.2, -0.25, -1.5, -2.5, -1.0, #Right (hip_yaw, hip_roll, hip_pitch, knee, ankle)
             -0.6, -0.2  #Head (neck, head)
         ],
         "dof_upper_limit": [ #order matters!
-            0.3, 0.25, 1.5, 2.5, 1.0, #Left (hip_yaw, hip_roll, hip_pitch, knee, ankle)
-            0.2, 0.35, 2.3, 0.8, 0.8, #Right (hip_yaw, hip_roll, hip_pitch, knee, ankle)
+            0.2, 0.25, 1.5, 2.5, 1.0, #Left (hip_yaw, hip_roll, hip_pitch, knee, ankle)
+            0.3, 0.35, 2.3, 0.8, 0.8, #Right (hip_yaw, hip_roll, hip_pitch, knee, ankle)
             1.5, 0.2  #Head (neck, head)
         ],
         'PD_stiffness': {'hip_yaw':   10.0,
@@ -162,13 +179,13 @@ def get_cfgs():
             "left_knee_joint",
             "right_knee_joint",     
         ],
-        "termination_if_roll_greater_than": 50,  # degree. 
-        "termination_if_pitch_greater_than": 50,
+        "termination_if_roll_greater_than": 30,  # degree. 
+        "termination_if_pitch_greater_than": 30,
         "termination_if_relative_height_lower_than": 0.15,
         "termination_duration": 1.0, #seconds
         "angle_termination_duration": 5.0, #seconds
         # base pose
-        "base_init_pos": [0.0, 0.0, 0.4],
+        "base_init_pos": [0.0, 0.0, 0.36],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
         "episode_length_s": 20.0,
         "resampling_time_s": 4.0,
@@ -177,7 +194,13 @@ def get_cfgs():
         'send_timeouts': True,
         "clip_actions": 100.0,
         'control_freq': 50,
-        'decimation': 4,
+        'decimation': 5, #5
+        'low_level_control': {
+            'enabled': True,
+            'first_order_hold': True,
+            'cutoff_freq_hz': 35.0,
+            'max_joint_velocity': 10.0,
+        },
         # random push
         'push_interval_s': 10,
         'max_push_vel_xy': 1.0,

@@ -34,7 +34,7 @@ reward_cfg_patch = {
         "powers": -2e-5,
         "termination": -30.0,
         "feet_contact_forces": -0.001,
-        "default_pose_when_idle": -5.0,
+        "default_pose_when_idle": -1.0,
         "similar_to_default": -0.1,
     },
 }
