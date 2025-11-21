@@ -23,24 +23,22 @@ reward_cfg_patch = {
         "tracking_lin_vel": 1.5,
         "tracking_ang_vel": 0.75,
         "lin_vel_z": -2.0,
-        "relative_base_height": -30.0,
+        "relative_base_height": -10.0,
         "orientation": -0.01,
         "ang_vel_xy": -0.05,
         "collision": -5.0,
-        "front_feet_clearance": 30.0,
-        "rear_feet_clearance": 30.0,
         # "foot_clearance": -0.5,
         "action_rate": -0.01,
         "dof_acc": -2.5e-7,
-        "dof_pos_limits": -20.0,
+        "dof_pos_limits": -10.0,
         "powers": -2e-5,
         "termination": -30.0,
         "both_front_feet_airborne": -1.0,
         "both_rear_feet_airborne": -1.0,
-        "contact_no_vel": -0.05,
         "feet_contact_forces": -0.0001,
-        "stand_still": -0.5,
-        "swing_stuck": -10.0
+        "default_pose_when_idle": -2.0,
+        "feet_stumble": -3.0,
+        "similar_to_default": -0.001,
     },
 }
 
@@ -53,13 +51,11 @@ terrain_cfg_patch = {
     "cols": 5,  #should be more than 5
     "rows": 5,   #should be more than 5
     "selected_terrains":{
-        # "flat_terrain" : {"probability": 0.3},
-        # "stamble_terrain" : {"probability": 0.1},
-        # "pyramid_sloped_terrain" : {"probability": 0.1},
-        # "discrete_obstacles_terrain" : {"probability": 0.1},
+        "flat_terrain" : {"probability": 0.3},
+        "stamble_terrain" : {"probability": 0.1},
+        "pyramid_sloped_terrain" : {"probability": 0.1},
+        "discrete_obstacles_terrain" : {"probability": 0.1},
         "pyramid_down_stairs_terrain" : {"probability": 0.2},
-        # "blocky_terrain": {"probability": 0.1},
-        "pyramid_steep_down_stairs_terrain" : {"probability": 0.2},
     }
 }
 
@@ -67,6 +63,7 @@ command_cfg_patch = {
     "num_commands": 3,
     "curriculum": True,
     "curriculum_iteration_threshold": 3000, #1 calculated 1 iteration is 1 seocnd 2000 = 
+    "mean_reward_threshold": 20,
     "lin_vel_x_range": [-1.0, 1.0],
     "lin_vel_y_range": [-0.5, 0.5],
     "ang_vel_range": [-1.0, 1.0],

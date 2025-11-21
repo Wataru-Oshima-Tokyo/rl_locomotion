@@ -52,10 +52,10 @@ def get_train_cfg(exp_name, max_iterations):
         "init_member_classes": {},
         "policy": {
             "activation": "elu",
-            "actor_hidden_dims": [256, 128, 64],
-            "critic_hidden_dims": [256, 128, 64],
+            "actor_hidden_dims": [768, 512, 256, 256],
+            "critic_hidden_dims": [768, 512, 256, 256],
             "init_noise_std": 1.0,
-            "class_name": "ActorCriticRecurrent", #"ActorCriticRecurrent", "ActorCriticRecurrentMoE"
+            "class_name": "ActorCritic", #"ActorCriticRecurrent", "ActorCriticRecurrentMoE"
             "rnn_type": "lstm",
             "rnn_hidden_size": 32, #256
             "rnn_num_layers": 1,
@@ -209,19 +209,23 @@ def get_cfgs():
         'randomize_kd_scale': True,
         'kd_scale_range': [0.98, 1.02],
         "randomize_rot": True,
-        "pitch_range": [-30, 30],  # degrees
-        "roll_range": [-30, 30],
+        "pitch_range": [-180, 180],  # degrees
+        "roll_range": [-180, 180],
         "yaw_range": [-180, 180],
     }
     obs_cfg = {
-        "num_obs": 45,
+        # 45次元 * 3 (生 + fast + slow) = 135
+        "num_obs": 135,
         "obs_components": [
             "base_ang_vel",        # 3
             "projected_gravity",   # 3
             "commands",            # 3
             "dof_pos_scaled",      # 12
             "dof_vel_scaled",      # 12
-            "actions"              # 12
+            "actions",             # 12
+            # ここから EMA を追加（dim はコード側で base_obs_dim から決まる）
+            "ema_fast",
+            "ema_slow",              
         ],
         "num_privileged_obs": 52,
         "privileged_obs_components": [
@@ -237,6 +241,8 @@ def get_cfgs():
             # "cos_phase",           # 4
             # "collision"            # 4
         ],
+        "ema_alpha_fast": 0.5,
+        "ema_alpha_slow": 0.87,
         "mirror_func": {
             "base_lin_vel": "mirror_linear",
             "base_ang_vel": "mirror_angle",
@@ -256,6 +262,8 @@ def get_cfgs():
             "dof_pos_scaled": 1.0,
             "dof_vel_scaled": 0.05,
             "torques_scaled": 0.03,
+            "ema_fast": 1.0,
+            "ema_slow": 1.0,
         },
         "clip_observations":100,
     }
@@ -264,6 +272,7 @@ def get_cfgs():
         "tracking_min_sigma": 0.05,
         "tracking_max_sigma": 0.25,
         "base_height_target": 0.36,
+        "effort_ema_alpha": 0.975,
         "relative_base_height_target": 0.36,
         "step_period": 1.0, #0.8
         "step_offset": 0.5, #0.5
@@ -296,6 +305,8 @@ def get_cfgs():
             "dof_pos_scaled": 0.01,
             "dof_vel_scaled": 1.5,
             "torques_scaled": 0.5,
+            "ema_fast": 0.0,
+            "ema_slow": 0.0,
         }
     }
     terrain_cfg = {

@@ -23,8 +23,8 @@ env_cfg_patch = {
 reward_cfg_patch = {
     "soft_dof_pos_limit": 1.0,
     "reward_scales": {
-        "tracking_lin_vel": 1.5,
-        "tracking_ang_vel": 0.75,
+        "tracking_lin_vel": 3.0, #1.5
+        "tracking_ang_vel": 1.5, #0.75
         "lin_vel_z": -5.0,
         "relative_base_height": -30.0,
         "orientation": -30.0, #fixed!
@@ -36,7 +36,7 @@ reward_cfg_patch = {
         "dof_pos_limits": -10.0, #fixed!
         "powers": -2e-5,
         "termination": -30.0,
-        "alive": 0.1,
+        "alive": 1.0,
         "contact": 0.1,
         "feet_contact_forces": -0.001,
         "default_pose_when_idle": -1.0,

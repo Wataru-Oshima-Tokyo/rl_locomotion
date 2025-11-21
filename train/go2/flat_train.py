@@ -14,7 +14,7 @@ from go2_base import train_main
 
 env_cfg_patch = {
     "self_collision": False,
-    "randomize_rot": False,
+    "randomize_rot": True,
     "base_init_pos": [0.0, 0.0, 0.45],
     # "termination_if_roll_greater_than": 60,
     # "termination_if_pitch_greater_than": 90,
@@ -22,38 +22,32 @@ env_cfg_patch = {
 }
 
 reward_cfg_patch = {
-    "soft_dof_pos_limit": 0.9,
+    "soft_dof_pos_limit": 1.0,
     "reward_scales": {
-        "tracking_lin_vel": 2.5,
-        "tracking_ang_vel": 1.75,
+        "tracking_lin_vel": 1.5,
+        "tracking_ang_vel": 0.75,
         "lin_vel_z": -5.0,
         "relative_base_height": -30.0,
-        "orientation": -1.0, #fixed!
+        "orientation": -10.0, #fixed!
         "ang_vel_xy": -0.05, #fixed!
-        "collision": -30.0, #fixed!
-        "bumper_collision": -10.0,
-        "action_rate": -0.01,
-        "dof_acc": -2.5e-7,
-        "dof_pos_limits": -10.0, #fixed!
-        "powers": -2e-5,
+        "collision": -10.0, #fixed!
+        "dof_pos_limits": -20.0, #fixed!
         "termination": -30.0,
         "front_hip": -0.2,
         "rear_hip": -0.5,
-        # "front_feet_clearance": 10.0,
-        # "rear_feet_clearance": 5.0,
-        "both_front_feet_airborne": -1.0,
-        "both_rear_feet_airborne": -1.0,
-        "feet_contact_forces": -0.001,
+        "feet_contact_forces": -0.0001,
         "default_pose_when_idle": -2.0,
-        "feet_stumble": -3.0,
-        "similar_to_default": -0.1,
+        "feet_stumble": -0.5,
+        "alive": 0.3,
+        "action_curvature": -0.1,
+        "effort_symmetry": -0.1,
     },
 }
 
 
 
 terrain_cfg_patch = {
-    "terrain_type": "single_step", #plane
+    "terrain_type": "single_step", #plane #single_step
 }
 
 
@@ -61,7 +55,7 @@ command_cfg_patch = {
     "num_commands": 3,
     "curriculum": False,
     "curriculum_iteration_threshold": 2000,
-    "mean_reward_threshold": 30,
+    "mean_reward_threshold": 22,
     "lin_vel_x_range": [-1.0, 1.0],
     "lin_vel_y_range": [-0.5, 0.5],
     "ang_vel_range": [-1.0, 1.0],

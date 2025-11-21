@@ -721,8 +721,6 @@ class LeggedEnv:
         self.global_gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device, dtype=gs.tc_float).repeat(
             self.num_envs, 1
         )
-
-        
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=gs.tc_float)
         self.zero_obs = torch.zeros(self.num_obs, device=self.device, dtype=gs.tc_float)
         self.zero_privileged_obs = torch.zeros(self.num_privileged_obs, device=self.device, dtype=gs.tc_float)
@@ -767,8 +765,6 @@ class LeggedEnv:
         print("noise scale vector: ", self.noise_scale_vec)
         self.actions = torch.zeros_like(self.actions)
         self.last_actions = torch.zeros_like(self.actions)
-        self.prev_actions = torch.zeros_like(self.actions)
-        self.prev_prev_actions = torch.zeros_like(self.actions)
         if self.use_low_level_control:
             self.prev_low_level_target = None
             self.low_level_filter_state = None
@@ -880,16 +876,6 @@ class LeggedEnv:
         self.init_foot()
         # self._randomize_controls()
         # self._randomize_rigids()
-        self.num_legs = self.num_feet             # Go2なら 4
-        self.joints_per_leg = self.num_dof // self.num_legs
-        if self.num_dof % self.num_legs != 0:
-            raise ValueError("num_dof が脚数で割り切れません")
-
-        self.torque_ema = torch.zeros(
-            (self.num_envs, self.num_legs, self.joints_per_leg),
-            device=self.device,
-            dtype=gs.tc_float,
-        )
         print(f"Dof_pos_limits{self.dof_pos_limits}")
         print(f"Default dof pos {self.default_dof_pos}")
         print(f"Default hip pos {self.default_hip_pos}")
@@ -936,17 +922,10 @@ class LeggedEnv:
         self.total_mass_buf = torch.zeros(
             (self.num_envs,), device=self.device, dtype=gs.tc_float
         )
+
         # 初期化時に一度リフレッシュ
         self._refresh_total_mass()
 
-        self.base_obs_components = [
-            c for c in self.obs_components
-            if c not in ("ema_fast", "ema_slow")
-        ]
-        self.base_obs_dim = None  # 最初の compute_observations で決める
-
-        self.obs_ema_fast = None  # (num_envs, base_obs_dim)
-        self.obs_ema_slow = None
 
     def get_terrain_height_at(self, x_world, y_world):
         if self.terrain_cfg["terrain_type"] == "plane" or self.terrain_cfg["terrain_type"] == "custom_plane" or self.terrain_cfg["terrain_type"] == "single_step":
@@ -1278,9 +1257,6 @@ class LeggedEnv:
 
     def step(self, actions):
         # if self.episode_length_buf >0:
-        # 新しい actions を使う前に履歴をずらす
-        self.prev_prev_actions[:] = self.prev_actions
-        self.prev_actions[:] = self.last_actions
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         if self.env_cfg["randomize_delay"] and self.mean_reward_flag:
             # 3️⃣ Store new actions in delay buffer (Shift the buffer)
@@ -1323,11 +1299,8 @@ class LeggedEnv:
                 self._apply_motor_torques(commanded_actions)
 
 
-        # --- トルク EMA 更新 --------------------------------
-        torques_leg = self.torques.view(self.num_envs, self.num_legs, self.joints_per_leg)
-        alpha_prev = self.reward_cfg.get("effort_ema_alpha", 0.975)  # 過去の重み
-        self.torque_ema = alpha_prev * self.torque_ema + (1.0 - alpha_prev) * torques_leg
-        # -----------------------------------------------------
+
+
 
 
         pos_after_step = self.robot.get_pos()
@@ -1461,7 +1434,6 @@ class LeggedEnv:
             "actions": actions,
         }
 
-        # まず「生のコンポーネント」を辞書に集める
         component_data_dict = {
             "base_lin_vel": base_lin_vel,
             "base_ang_vel": base_ang_vel,
@@ -1477,35 +1449,21 @@ class LeggedEnv:
             "foot_friction": foot_mu,
         }
 
-        # --- 1) base_obs を構成（EMA対象） --------------------
-        base_obs = build_obs_buf(component_data_dict, self.base_obs_components)
-        if self.base_obs_dim is None:
-            self.base_obs_dim = base_obs.shape[-1]
+        # for name, tensor in debug_items.items():
+        #     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        #         print(f">>> WARNING: NaN or Inf in {name} <<<")
+        #         print(tensor)
 
-        # --- 2) EMA を更新 -----------------------------------
-        if self.obs_ema_fast is None:
-            self.obs_ema_fast = base_obs.clone()
-            self.obs_ema_slow = base_obs.clone()
-        else:
-            alpha_f = self.obs_cfg.get("ema_alpha_fast", 0.5)
-            alpha_s = self.obs_cfg.get("ema_alpha_slow", 0.87)
-            self.obs_ema_fast = alpha_f * self.obs_ema_fast  + (1 - alpha_f) * base_obs
-            self.obs_ema_slow = alpha_s * self.obs_ema_slow  + (1 - alpha_s) * base_obs
-
-        # --- 3) EMA を component_data_dict に追加 -------------
-        component_data_dict["ema_fast"] = self.obs_ema_fast
-        component_data_dict["ema_slow"] = self.obs_ema_slow
-
-        # --- 4) component_dim_dict の初期化 -------------------
         if self.component_dim_dict is None:
             self.component_dim_dict = {}
-            for key, value in component_data_dict.items():
+            for key , value in component_data_dict.items():
                 self.component_dim_dict[key] = value.shape[-1]
             self.noise_scale_vec = self._get_noise_scale_vec()
             print("noise scale vector: ", self.noise_scale_vec)
 
-        # --- 5) obs_buf / privileged_obs_buf を構成 -----------
+        # compute observations
         self.obs_buf = build_obs_buf(component_data_dict, self.obs_components)
+
         self.privileged_obs_buf = build_obs_buf(component_data_dict, self.privileged_obs_components)
 
         self.obs_buf = torch.clip(self.obs_buf, -self.clip_obs, self.clip_obs)
@@ -1517,8 +1475,10 @@ class LeggedEnv:
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
 
+        # Final check
         if torch.isnan(self.obs_buf).any() or torch.isinf(self.obs_buf).any():
             print(">>> WARNING: NaN or Inf in final obs_buf <<<")
+            print(self.obs_buf)
 
 
 
@@ -3055,30 +3015,3 @@ class LeggedEnv:
         center_pen         = center_violation_m / max(hip_w, eps)
 
         return soft_pen + hard_pen + center_pen
-
-    def _reward_action_curvature(self):
-        """
-        離散二階差分でアクション曲率を近似してペナルティにする。
-        """
-        a_t   = self.actions          # (N, A)
-        a_tm1 = self.prev_actions
-        a_tm2 = self.prev_prev_actions
-
-        a_ddot = a_t - 2.0 * a_tm1 + a_tm2
-        denom = (1.0 + a_tm1**2).pow(1.5)
-        tiny = 1e-6
-        racurv_per_dof = torch.abs(a_ddot) / (denom + tiny)
-
-        racurv = racurv_per_dof.sum(dim=1)  # Σ_i
-        return racurv
-
-    def _reward_effort_symmetry(self):
-        """
-        各関節種別(hip/thigh/calf)ごとに脚方向のトルク EMA の std を取ってペナルティ。
-        torque_ema: (N, L, J) L=脚数, J=関節数/脚
-        """
-        # 脚方向で標準偏差 → (N, J)
-        std_per_joint = torch.std(self.torque_ema, dim=1)
-        reffort = std_per_joint.sum(dim=1)  # Σ over joint-types
-
-        return reffort
