@@ -1524,9 +1524,10 @@ class LeggedEnvHum:
             )
 
             # ─── GREEN arrow: commanded velocity (rotated to world frame) ─
-            cmd_body = torch.tensor(
-                [*self.commands[env_idx, :2], 0.0],
-                device=self.device, dtype=gs.tc_float
+            # Avoid torch.tensor(list_of_tensors) to prevent copy-construct warning
+            cmd_body = torch.cat(
+                (self.commands[env_idx, :2], torch.zeros(1, device=self.device, dtype=gs.tc_float)),
+                dim=0,
             ).unsqueeze(0)
             cmd_world = transform_by_quat(
                 cmd_body,

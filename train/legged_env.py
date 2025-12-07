@@ -132,6 +132,9 @@ class LeggedEnv:
         self.curriculum_complete_flag = False
         self.current_iteration = 0
         self.curriculum_iteration_threshold = command_cfg["curriculum_iteration_threshold"]
+        self.enable_stop_commands = bool(command_cfg.get("enable_stop_commands", False))
+        self.stop_command_probability = float(command_cfg.get("stop_command_probability", 0.0))
+        self.stop_command_probability = min(max(self.stop_command_probability, 0.0), 1.0)
         # self.joint_limits = env_cfg["joint_limits"]
         self.simulate_action_latency = env_cfg["simulate_action_latency"]  # there is a 1 step latency on real robot
         self.dt = 1 / env_cfg['control_freq']
@@ -168,6 +171,22 @@ class LeggedEnv:
 
         self.obs_components = self.obs_cfg["obs_components"]
         self.privileged_obs_components = self.obs_cfg["privileged_obs_components"]
+        # Height-patch sensing (height map slice around the base)
+        hp_cfg = env_cfg.get("height_patch", {})
+        self.height_patch_enabled = bool(hp_cfg.get("enabled", False))
+        self.height_patch_size = float(hp_cfg.get("size_m", 1.0))
+        self.height_patch_points = int(hp_cfg.get("grid_points", 10))
+        self.height_patch_res = self.height_patch_size / max(1, self.height_patch_points - 1)
+        self.height_patch_dim = self.height_patch_points * self.height_patch_points
+        hp_lin = torch.linspace(
+            -0.5 * self.height_patch_size,
+            0.5 * self.height_patch_size,
+            self.height_patch_points,
+            device=self.device,
+            dtype=gs.tc_float,
+        )
+        hp_x, hp_y = torch.meshgrid(hp_lin, hp_lin, indexing="ij")
+        self.height_patch_offsets = torch.stack((hp_x, hp_y), dim=-1)  # (G, G, 2)
 
         self.merged_components = []
         for comp in self.obs_components + self.privileged_obs_components:
@@ -250,6 +269,8 @@ class LeggedEnv:
                 fov=30,
                 GUI=self.show_camera_        
             )
+        # Frame/video recording is optional; keep it off unless explicitly enabled in env_cfg.
+        self.enable_recording = bool(env_cfg.get("enable_recording", False))
         self._recording = False
         self.mean_reward_flag = False
         self.mean_reward_half_flag = False
@@ -299,6 +320,29 @@ class LeggedEnv:
 
             self.global_terrain = self.scene.add_entity(self.terrain)
             
+            self.subterrain_centers = []
+            terrain_origin_x, terrain_origin_y, terrain_origin_z = self.terrain.pos
+            self.height_field = self.global_terrain.geoms[0].metadata["height_field"]
+
+            for row in range(self.rows):
+                for col in range(self.cols):
+                    subterrain_center_x = terrain_origin_x + (col + 0.5) * subterrain_size
+                    subterrain_center_y = terrain_origin_y + (row + 0.5) * subterrain_size
+                    subterrain_center_z = get_height_at_xy(
+                        self.height_field,
+                        subterrain_center_x,
+                        subterrain_center_y,
+                        horizontal_scale,
+                        vertical_scale,
+                        self.center_x,
+                        self.center_y
+                    )
+                    self.subterrain_centers.append(
+                        (subterrain_center_x, subterrain_center_y, subterrain_center_z)
+                    )
+            # Goal targets: subterrain centers
+            self.goal_positions = list(self.subterrain_centers)
+
         else:
             if self.terrain_type == "custom_plane":
                 # self.scene.add_entity(
@@ -340,6 +384,7 @@ class LeggedEnv:
                         ( offset,  0.0,  z_spawn), # right beam center
                         (-offset,  0.0,  z_spawn), # left beam center
                     ])
+                self.goal_positions = list(self.available_positions)
 
             elif self.terrain_type == "single_step":
                 self.scene.add_entity(
@@ -377,6 +422,7 @@ class LeggedEnv:
                         ( offset,  0.0,  z_spawn), # right beam center
                         (-offset,  0.0,  z_spawn), # left beam center
                     ])
+                self.goal_positions = list(self.available_positions)
             else:
                 self.scene.add_entity(
                     gs.morphs.Plane(),
@@ -385,6 +431,7 @@ class LeggedEnv:
 
                 # Center (on the ground)
                 self.available_positions.append((0.0, 0.0, 0.0))
+                self.goal_positions = list(self.available_positions)
 
                 # for R, H in rings:
                 #     offset = R + t / 2.0     # beam center from origin
@@ -403,6 +450,12 @@ class LeggedEnv:
         self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=self.device)
         self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=self.device)
         self.inv_base_init_quat = inv_quat(self.base_init_quat)
+        # Goal pool (subterrain centers or fallback to spawn positions)
+        if not hasattr(self, "goal_positions"):
+            self.goal_positions = list(self.available_positions)
+        self.goal_pool = list(self.goal_positions)
+        self.goal_pool_len = len(self.goal_pool)
+        self.goal_used_mask = None  # (N_envs, goal_pool_len) set in init_buffers
         if self.env_cfg["use_mjcf"]:
             self.robot  = self.scene.add_entity(
                 gs.morphs.MJCF(
@@ -426,9 +479,7 @@ class LeggedEnv:
         # build
         self.scene.build(n_envs=num_envs)
         if self.terrain_type != "plane" and self.terrain_type != "custom_plane" and self.terrain_type != "single_step":
-            # 1m ごとの座標を保存するリスト
-            
-
+            # use dense grid for respawn sampling
             step = 1.0  # 1m 間隔
             terrain_origin_x, terrain_origin_y, terrain_origin_z = self.terrain.pos
             self.height_field = self.global_terrain.geoms[0].metadata["height_field"]
@@ -453,7 +504,7 @@ class LeggedEnv:
                         # 範囲外は無視
                         continue
 
-            print(f"Stored {len(self.available_positions)} positions")
+            print(f"Stored {len(self.available_positions)} positions for respawn; {len(self.goal_positions)} goal centers")
 
             # self.subterrain_centers = []
             # # Get the terrain's origin position in world coordinates
@@ -521,8 +572,8 @@ class LeggedEnv:
         self.thigh_indices = find_link_indices(
             self.env_cfg['thigh_link_name']
         )
-        self.bumper_indices = find_link_indices(
-            "bumper"
+        self.head_indices = find_link_indices(
+            "head"
         )
         self.body_half_length = torch.tensor(
             self.env_cfg.get("body_half_length", 0.35),  # 例: 長手方向の半分[m]
@@ -748,6 +799,11 @@ class LeggedEnv:
             device=self.device,
             dtype=gs.tc_float,
         )
+        self.idle_leg_raise_duration = torch.zeros(
+            (self.num_envs, len(self.feet_indices)),
+            device=self.device,
+            dtype=gs.tc_float,
+        )
         self.feet_max_height = torch.zeros(
             (self.num_envs, len(self.feet_indices)),
             device=self.device,
@@ -784,6 +840,33 @@ class LeggedEnv:
         )
         self.base_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
+        # --- ゴール追従用バッファ ----------------------------------
+        self.goal_pos = torch.zeros(
+            (self.num_envs, 3), device=self.device, dtype=gs.tc_float
+        )  # 世界座標でのゴール位置
+        self.has_goal = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )  # ゴールを持っているかどうか
+        self.goal_reached_flag = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )  # ゴール到達を1 stepだけ通知するフラグ
+        if self.goal_pool_len > 0:
+            self.goal_used_mask = torch.zeros(
+                (self.num_envs, self.goal_pool_len), device=self.device, dtype=torch.bool
+            )
+        self.goal_max_speed = torch.zeros(
+            self.num_envs, device=self.device, dtype=gs.tc_float
+        )  # 各ゴールに対して設定する最大速度
+        self.goal_mode = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )  # 0:なし, 1:正面, 2:左側面, 3:右側面, 4:後ろ向き
+        # ------------------------------------------------------------        
+        
+        if self.height_patch_enabled:
+            hp_shape = (self.num_envs, self.height_patch_points, self.height_patch_points)
+            self.height_patch_world = torch.zeros(hp_shape, device=self.device, dtype=gs.tc_float)
+            self.height_patch_rel = torch.zeros(hp_shape, device=self.device, dtype=gs.tc_float)
+            self.height_patch_flat = torch.zeros(self.num_envs, self.height_patch_dim, device=self.device, dtype=gs.tc_float)
         self.default_dof_pos = torch.tensor(
             [self.env_cfg["default_joint_angles"][name] for name in self.env_cfg["dof_names"]],
             device=self.device,
@@ -813,6 +896,18 @@ class LeggedEnv:
             dtype=torch.float, 
             device=self.device, 
             requires_grad=False
+        )
+        self.leg_cross_duration_buf = torch.zeros(
+            self.num_envs,
+            dtype=torch.float,
+            device=self.device,
+            requires_grad=False,
+        )
+        self.swing_stuck_ema = torch.zeros(
+            self.num_envs,
+            dtype=gs.tc_float,
+            device=self.device,
+            requires_grad=False,
         )
         self.low_height_duration_buf = torch.zeros(
             self.num_envs, 
@@ -1000,6 +1095,7 @@ class LeggedEnv:
         self.commands[envs_idx, 2] = gs_rand_float(
             ang_min, ang_max, (len(envs_idx),), self.device
         )
+        self._maybe_apply_stop_commands(envs_idx)
 
 
     def assign_fixed_commands(self, envs_idx):
@@ -1040,55 +1136,8 @@ class LeggedEnv:
         self.commands[envs_idx] = cmds
         # self._current_command_types[envs_idx] = cmd_types  # Track types only for updated envs
 
+        self._maybe_apply_stop_commands(envs_idx)
         
-
-
-    def assign_fixed_commands_max(self, envs_idx):
-        """
-        Give each env in `envs_idx` one of four max-speed commands, chosen by
-        (env_id % 4):
-
-            0 → forward  (+x)
-            1 → backward (−x)
-            2 → right    (+y)
-            3 → left     (−y)
-        """
-        envs_idx = torch.as_tensor(envs_idx, device=self.device, dtype=torch.long)
-        n_cmds   = 4
-
-        # Now the mapping is stable even if we pass a single env idx at a time
-        cmd_types = (envs_idx % n_cmds).long()
-
-        # Build the command tensor row-by-row
-        cmds = torch.zeros((len(envs_idx), 3), device=self.device)
-
-        forward_mask   = cmd_types == 0
-        backward_mask  = cmd_types == 1
-        right_mask     = cmd_types == 2
-        left_mask      = cmd_types == 3
-
-        # +x  (forward)
-        cmds[forward_mask, 0]  = self.command_cfg["lin_vel_x_range"][1]
-        # –x  (backward)
-        cmds[backward_mask, 0] = self.command_cfg["lin_vel_x_range"][0]
-        # +y  (right)
-        cmds[right_mask, 1]    = self.command_cfg["lin_vel_y_range"][1]
-        # –y  (left)
-        cmds[left_mask, 1]     = self.command_cfg["lin_vel_y_range"][0]
-
-        # Write into the global buffer
-        self.commands[envs_idx] = cmds
-
-
-    def _resample_commands_max(self, envs_idx):
-        # Sample linear and angular velocities
-        self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
-        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
-        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), self.device)
-
-        # Randomly multiply by -1 or 1 (50/50 chance)
-        random_signs = torch.randint(0, 2, self.commands[envs_idx].shape, device=self.device) * 2 - 1
-        self.commands[envs_idx] *= random_signs
 
     def biased_sample(self, min_val, max_val, size, device, bias=2.0):
         """
@@ -1099,9 +1148,6 @@ class LeggedEnv:
         skewed_samples = uniform_samples ** (1.0 / bias)  # Biasing towards 1
         return min_val + (max_val - min_val) * skewed_samples
 
-    def _resample_commands_without_omega(self, envs_idx):
-        self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
-        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
 
     def _resample_commands(self, envs_idx):
         if True:
@@ -1112,11 +1158,28 @@ class LeggedEnv:
             )
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), self.device)
+        self._maybe_apply_stop_commands(envs_idx)
 
     def _zero_commands(self, envs_idx):
         self.commands[envs_idx, 0] = 0.0
         self.commands[envs_idx, 1] = 0.0
         self.commands[envs_idx, 2] = 0.0
+
+    def _maybe_apply_stop_commands(self, envs_idx):
+        """
+        Optionally zero commands for a random subset of envs.
+        Controlled via command_cfg fields:
+          - enable_stop_commands (bool)
+          - stop_command_probability (float in [0,1])
+        """
+        if not self.enable_stop_commands or self.stop_command_probability <= 0.0:
+            return
+        envs_idx = torch.as_tensor(envs_idx, device=self.device, dtype=torch.long)
+        if envs_idx.numel() == 0:
+            return
+        stop_mask = torch.rand(envs_idx.numel(), device=self.device) < self.stop_command_probability
+        if stop_mask.any():
+            self._zero_commands(envs_idx[stop_mask])
 
 
     def generate_subterrain_grid(self, rows, cols, terrain_types, weights):
@@ -1126,17 +1189,50 @@ class LeggedEnv:
         to another 'pyramid_sloped_terrain'.
         """
         grid = [[None for _ in range(cols)] for _ in range(rows)]
+        max_attempts = 10
+
+        def has_adjacent_match(r, c, predicate):
+            # Only need to check already-filled neighbors (up/left) while building row-wise
+            for dr, dc in [(-1, 0), (0, -1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    neighbor = grid[nr][nc]
+                    if neighbor is not None and predicate(neighbor):
+                        return True
+            return False
+
+        def resolve_choice(raw_choice):
+            """Map raw weighted choice to a final terrain token."""
+            if raw_choice == "pyramid_sloped_terrain":
+                return random.choice(["pyramid_sloped_terrain", "pyramid_down_sloped_terrain"])
+            if raw_choice == "pyramid_stairs_terrain":
+                terrain_options = ["pyramid_stairs_terrain", "pyramid_down_stairs_terrain"]
+                terrain_weights = [0.0, 1.0]  # climb up priority
+                return random.choices(terrain_options, weights=terrain_weights, k=1)[0]
+            return raw_choice
+
         for i in range(rows):
             for j in range(cols):
-                terrain_choice = random.choices(terrain_types, weights=weights, k=1)[0]
-                if terrain_choice == "pyramid_sloped_terrain":
-                    terrain_choice = random.choice(["pyramid_sloped_terrain", "pyramid_down_sloped_terrain"])
-                elif terrain_choice == "pyramid_stairs_terrain":
-                    # Define terrain options and their corresponding probabilities
-                    terrain_options = ["pyramid_stairs_terrain", "pyramid_down_stairs_terrain"]
-                    terrain_weights = [0.0, 1.0]  # climb up priority
-                    # Choose terrain based on the weights
-                    terrain_choice = random.choices(terrain_options, weights=terrain_weights, k=1)[0]
+                terrain_choice = None
+                for _ in range(max_attempts):
+                    candidate = resolve_choice(random.choices(terrain_types, weights=weights, k=1)[0])
+
+                    # Avoid adjacent slopes and stairs
+                    if "stair" in candidate and has_adjacent_match(i, j, lambda t: "stair" in t):
+                        continue
+
+                    terrain_choice = candidate
+                    break
+
+                # Fallback: choose any non-conflicting terrain if repeated attempts failed
+                if terrain_choice is None:
+                    non_conflicting = []
+                    for raw in terrain_types:
+                        candidate = resolve_choice(raw)
+                        if "stair" in candidate and has_adjacent_match(i, j, lambda t: "stair" in t):
+                            continue
+                        non_conflicting.append(candidate)
+                    terrain_choice = random.choice(non_conflicting) if non_conflicting else resolve_choice(terrain_types[0])
 
                 grid[i][j] = terrain_choice
         return grid
@@ -1200,6 +1296,33 @@ class LeggedEnv:
         # Apply rotation to transform to base frame
         points_base = torch.einsum('bij,bkj->bki', R.transpose(1, 2), points_relative)
         return points_base
+
+    def _update_height_patch(self):
+        if not self.height_patch_enabled:
+            return
+        base_xy = self.base_pos[:, :2]  # (N,2)
+        base_z = self.base_pos[:, 2].view(self.num_envs, 1, 1)  # (N,1,1)
+
+        # Broadcast offsets
+        world_x = base_xy[:, None, None, 0] + self.height_patch_offsets[..., 0]
+        world_y = base_xy[:, None, None, 1] + self.height_patch_offsets[..., 1]
+
+        if self.terrain_type in ("plane", "custom_plane", "single_step"):
+            heights_world = torch.zeros_like(world_x, device=self.device, dtype=gs.tc_float)
+        else:
+            hf = self.height_field_tensor  # shape (rows, cols)
+            hs = self.terrain_cfg["horizontal_scale"]
+            vs = self.terrain_cfg["vertical_scale"]
+
+            idx_x = torch.floor((world_x + self.center_x) / hs).long()
+            idx_y = torch.floor((world_y + self.center_y) / hs).long()
+            idx_x = torch.clamp(idx_x, 0, hf.shape[0] - 1)
+            idx_y = torch.clamp(idx_y, 0, hf.shape[1] - 1)
+            heights_world = hf[idx_x, idx_y] * vs
+
+        self.height_patch_world[:] = heights_world
+        self.height_patch_rel[:] = heights_world - base_z
+        self.height_patch_flat[:] = self.height_patch_rel.view(self.num_envs, -1)
 
     def _get_feet_forces_and_contact(self, force_thresh=1.0):
         """
@@ -1361,6 +1484,8 @@ class LeggedEnv:
             device=self.device,
             dtype=gs.tc_float,
         )        
+        if self.height_patch_enabled:
+            self._update_height_patch()
         # resample commands
         envs_idx = (
             (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
@@ -1394,6 +1519,10 @@ class LeggedEnv:
                 self.assign_commands_euler(envs_half_and_resample_no_ang)
         elif not self.control_:
             self._resample_commands(envs_idx)
+
+        # --- ここでゴール付き env の commands を毎ステップ上書き ---
+        self._assign_goal_commands_every_step()
+        # ---------------------------------------------------------
 
         envs_idx_with_ang_cmd = (
             torch.abs(self.commands[:, 2]) > ANG_VEL_EPS
@@ -1476,6 +1605,8 @@ class LeggedEnv:
             "collision": collision,
             "foot_friction": foot_mu,
         }
+        if self.height_patch_enabled:
+            component_data_dict["height_patch"] = self.height_patch_flat
 
         # --- 1) base_obs を構成（EMA対象） --------------------
         base_obs = build_obs_buf(component_data_dict, self.base_obs_components)
@@ -1507,6 +1638,14 @@ class LeggedEnv:
         # --- 5) obs_buf / privileged_obs_buf を構成 -----------
         self.obs_buf = build_obs_buf(component_data_dict, self.obs_components)
         self.privileged_obs_buf = build_obs_buf(component_data_dict, self.privileged_obs_components)
+
+        if self.obs_buf.shape[1] != self.num_obs:
+            raise ValueError(f"obs_buf dim {self.obs_buf.shape[1]} does not match configured num_obs={self.num_obs}")
+        if self.privileged_obs_buf.shape[1] != self.num_privileged_obs:
+            raise ValueError(
+                f"privileged_obs_buf dim {self.privileged_obs_buf.shape[1]} "
+                f"does not match configured num_privileged_obs={self.num_privileged_obs}"
+            )
 
         self.obs_buf = torch.clip(self.obs_buf, -self.clip_obs, self.clip_obs)
         self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -self.clip_obs, self.clip_obs)
@@ -1616,8 +1755,26 @@ class LeggedEnv:
         self.low_height_duration_buf[~low_h] = 0.0
         reset_low_h = self.low_height_duration_buf > self.env_cfg["termination_duration"]
 
+        # --- lateral leg crossing guard (kinematic, no self-collision) -----------
+        cross_term_depth = float(self.reward_cfg.get("cross_terminate_depth", 0.0))
+        cross_term_duration = float(self.reward_cfg.get("cross_terminate_duration", 0.0))
+        if cross_term_depth > 0.0:
+            _, cross_depth = self._compute_leg_clearance_penalty(include_rear=True, return_depth=True)
+            cross_violation = cross_depth > cross_term_depth
+            self.leg_cross_duration_buf[cross_violation] += self.dt
+            self.leg_cross_duration_buf[~cross_violation] = 0.0
+            if cross_term_duration <= 0.0:
+                reset_cross = cross_violation
+            else:
+                reset_cross = self.leg_cross_duration_buf > cross_term_duration
+            safety_extras = self.extras.setdefault("safety", {})
+            safety_extras["leg_cross_depth"] = cross_depth
+            safety_extras["leg_cross_violation"] = cross_violation.float()
+        else:
+            reset_cross = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+
         # --- combine --------------------------------------------------------------
-        self.reset_buf = reset_contact | reset_low_h
+        self.reset_buf = reset_contact | reset_low_h | reset_cross
 
         if not self.termination_exceed_degree_ignored:
             # Check where pitch and roll exceed thresholds
@@ -1690,6 +1847,191 @@ class LeggedEnv:
 
         self.time_out_buf = self.episode_length_buf > self.max_episode_length  # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
+
+
+
+    def _assign_goal_commands_every_step(self):
+        """
+        has_goal == True の env だけ、
+        ・ゴールへ向かうような線形速度コマンド
+        ・ゴールに正対 / 側面 / 後ろ向き となる yaw コマンド
+        を毎ステップ上書きする。
+        """
+        if not hasattr(self, "has_goal") or not self.has_goal.any():
+            return
+
+        goal_mask = self.has_goal
+        idx = goal_mask.nonzero(as_tuple=False).flatten()
+        if idx.numel() == 0:
+            return
+
+        base_pos = self.base_pos[idx]      # (M,3)
+        goal_pos = self.goal_pos[idx]      # (M,3)
+        delta_xy = goal_pos[:, :2] - base_pos[:, :2]
+        dist_xy = torch.norm(delta_xy, dim=1)  # (M,)
+
+        # ゴールとほぼ同じ場所にいるやつはスキップ
+        eps = 1e-3
+        active_mask = dist_xy > eps
+        if not active_mask.any():
+            return
+
+        idx = idx[active_mask]
+        delta_xy = delta_xy[active_mask]
+        dist_xy = dist_xy[active_mask]
+        modes = self.goal_mode[idx]
+
+        # --- yaw 方向の制御 ----------------------------------------
+        # ゴール方向（世界座標系）: atan2(dy, dx)
+        target_yaw = torch.atan2(delta_xy[:, 1], delta_xy[:, 0])  # (K,)
+        curr_yaw = self.base_euler[idx, 2]                        # (K,)
+
+        # 「正面をゴールに向けたとき」の yaw
+        yaw_facing_goal = target_yaw
+
+        # モードに応じてオフセット追加
+        yaw_offset = torch.zeros_like(yaw_facing_goal)
+        yaw_offset[modes == 2] =  math.pi / 2.0   # 左側面をゴールに向ける
+        yaw_offset[modes == 3] = -math.pi / 2.0   # 右側面
+        yaw_offset[modes == 4] =  math.pi         # 後ろ向きでゴール側を向く
+
+        yaw_des = yaw_facing_goal + yaw_offset
+        # [-pi, pi] に wrap
+        yaw_error = yaw_des - curr_yaw
+        yaw_error = (yaw_error + math.pi) % (2 * math.pi) - math.pi
+
+        k_yaw = self.command_cfg.get("goal_yaw_kp", 2.0)
+        ang_min, ang_max = self.command_cfg["ang_vel_range"]
+        yaw_cmd = torch.clamp(k_yaw * yaw_error, min=ang_min, max=ang_max)
+
+        # --- 線形速度の制御 ----------------------------------------
+        # ゴールまでの距離に比例してスピードを決める（上限あり）
+        k_v = self.command_cfg.get("goal_v_kp", 0.5)
+        max_v_x = self.command_cfg["lin_vel_x_range"][1]
+        max_v_y = self.command_cfg["lin_vel_y_range"][1]
+        v_max = min(max_v_x, max_v_y)
+        # ゴール専用にサンプリングした最大速度があればそれを使う
+        if hasattr(self, "goal_max_speed") and self.goal_max_speed.numel() >= self.num_envs:
+            v_max_env = self.goal_max_speed[idx]
+        else:
+            v_max_env = torch.full_like(dist_xy, v_max)
+        # clamp supports tensor-tensor; min must be tensor as well
+        zero_floor = torch.zeros_like(dist_xy)
+        v_des = torch.clamp(k_v * dist_xy, min=zero_floor, max=v_max_env)
+
+        # base frame でのコマンド [vx, vy, yaw]
+        cmds = torch.zeros((idx.numel(), 3), device=self.device, dtype=gs.tc_float)
+
+        # デフォルトは正面方向へ進む
+        cmds[:, 0] = v_des
+
+        # 後ろ向きモードは後退
+        cmds[modes == 4, 0] = -v_des[modes == 4]
+
+        # 左右側面モードでは横移動のみでゴールを狙う（x=0, y 方向で最短移動）
+        side_mask = (modes == 2) | (modes == 3)
+        cmds[side_mask, 0] = 0.0
+        cmds[modes == 2, 1] = -v_des[modes == 2]  # 左面を向く→右へステップ
+        cmds[modes == 3, 1] =  v_des[modes == 3]  # 右面を向く→左へステップ
+
+        # yaw コマンド
+        cmds[:, 2] = yaw_cmd
+
+        # 最後に self.commands を上書き
+        self.commands[idx] = cmds
+
+        # --- ゴール到達判定（一定距離以内に近づいたらゴール更新） ----
+        goal_radius = self.command_cfg.get("goal_radius", 0.3)
+        reached = dist_xy < goal_radius
+        if reached.any():
+            reached_envs = idx[reached]
+            # ゴールに到達した env には新しいゴールを割り当てる
+            self.goal_reached_flag[reached_envs] = True
+            self._assign_new_goals(reached_envs)
+
+
+    def _assign_new_goals(self, envs_idx, p_goal=None):
+        """
+        envs_idx に対して一定確率でゴールを割り当てる。
+        p_goal: 1.0 にすると「必ずゴールを持つ」。
+        """
+        if p_goal is None:
+            p_goal = self.command_cfg.get("goal_probability", 0.3)
+
+        if len(envs_idx) == 0:
+            return
+
+        envs_idx = torch.as_tensor(envs_idx, device=self.device, dtype=torch.long)
+
+        # 利用可能なゴール候補がなければ何もしない
+        goal_pool = getattr(self, "goal_positions", self.available_positions)
+        if len(goal_pool) == 0 or p_goal <= 0.0:
+            self.has_goal[envs_idx] = False
+            return
+
+        # ゴールを持たせるかどうかを確率的に決める
+        rand = torch.rand(len(envs_idx), device=self.device)
+        use_goal_mask = rand < p_goal
+
+        envs_with_goal = envs_idx[use_goal_mask]
+        envs_no_goal   = envs_idx[~use_goal_mask]
+
+        # ゴールを持たない env はフラグを落とす
+        if envs_no_goal.numel() > 0:
+            self.has_goal[envs_no_goal] = False
+            self.goal_mode[envs_no_goal] = 0
+
+        if envs_with_goal.numel() == 0:
+            return
+
+        # ゴール候補から「現在位置に最も近い」ものを選ぶ
+        goal_pool_tensor = torch.as_tensor(goal_pool, device=self.device, dtype=gs.tc_float)  # (M,3)
+        base_pos = self.base_pos[envs_with_goal]  # (K,3)
+        prev_goal = self.goal_pos[envs_with_goal]  # (K,3)
+        used_mask = None
+        if self.goal_used_mask is not None and self.goal_used_mask.shape[1] == goal_pool_tensor.shape[0]:
+            used_mask = self.goal_used_mask[envs_with_goal]  # (K,M)
+
+        # 距離計算（K,M）
+        diff = goal_pool_tensor.unsqueeze(0) - base_pos.unsqueeze(1)
+        dist_sq = torch.sum(diff * diff, dim=2)
+        same_goal = torch.all(
+            torch.isclose(goal_pool_tensor.unsqueeze(0), prev_goal.unsqueeze(1), atol=1e-5),
+            dim=2,
+        )
+        dist_sq = dist_sq.masked_fill(same_goal, float("inf"))
+        if used_mask is not None:
+            dist_sq = dist_sq.masked_fill(used_mask, float("inf"))
+            all_inf = torch.isinf(dist_sq).all(dim=1)
+            if all_inf.any():
+                # reset usage for exhausted envs and recompute distances
+                self.goal_used_mask[envs_with_goal[all_inf]] = False
+                dist_sq_re = torch.sum(diff[all_inf] * diff[all_inf], dim=2)
+                dist_sq[all_inf] = dist_sq_re.masked_fill(same_goal[all_inf], float("inf"))
+        nearest_idx = torch.argmin(dist_sq, dim=1)  # (K,)
+
+        chosen_positions = goal_pool_tensor[nearest_idx]  # (K,3)
+        self.goal_pos[envs_with_goal] = chosen_positions
+        if used_mask is not None:
+            self.goal_used_mask[envs_with_goal, nearest_idx] = True
+
+        # 各 env ごとに最大速度をランダム設定（>=0.5）
+        lin_min, lin_max = self.command_cfg["lin_vel_x_range"]
+        lin_min = max(0.5, lin_min)
+        max_speed = torch.empty(envs_with_goal.numel(), device=self.device, dtype=gs.tc_float).uniform_(lin_min, lin_max)
+        self.goal_max_speed[envs_with_goal] = max_speed
+
+        # 1:正面, 2:左側面, 3:右側面, 4:後ろ向き （前進を優先的に付与）
+        mode_probs = torch.tensor(
+            [0.7, 0.05, 0.05, 0.20], device=self.device, dtype=gs.tc_float
+        )
+        mode_probs = mode_probs / mode_probs.sum()  # safety normalize
+        cdf = torch.cumsum(mode_probs, dim=0)
+        u = torch.rand(envs_with_goal.numel(), device=self.device)
+        modes = torch.bucketize(u, cdf).to(torch.long) + 1  # bucket → {0..3} → {1..4}
+        self.goal_mode[envs_with_goal] = modes
+        self.has_goal[envs_with_goal] = True
+
 
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
@@ -1768,11 +2110,14 @@ class LeggedEnv:
         self.hip_vel[envs_idx] = 0.0
         self.thigh_dof_pos[envs_idx] = 0.0
         self.thigh_dof_vel[envs_idx] = 0.0
-        self.episode_length_buf[envs_idx] = -(2/ self.dt)
+        self.episode_length_buf[envs_idx] = -(0.5/ self.dt)
         self.feet_air_time[envs_idx] = 0.0
+        self.idle_leg_raise_duration[envs_idx] = 0.0
         self.feet_max_height[envs_idx] = 0.0
         self.reset_buf[envs_idx] = True
         self.contact_duration_buf[envs_idx] = 0.0
+        self.leg_cross_duration_buf[envs_idx] = 0.0
+        self.swing_stuck_ema[envs_idx] = 0.0
         self.low_height_duration_buf[envs_idx] = 0.0
         self.episode_returns[envs_idx]  = 0.0
         self.obs_buf[envs_idx]                = 0.0
@@ -1801,6 +2146,21 @@ class LeggedEnv:
             self.episode_sums[key][envs_idx] = 0.0
 
         self._zero_commands(envs_idx)
+
+        # --- ゴール関連のリセットと再割り当て -----------------------
+        # 一旦フラグをクリアしてから、新しいゴールを割り当てる
+        self.has_goal[envs_idx] = False
+        self.goal_pos[envs_idx] = 0.0
+        self.goal_mode[envs_idx] = 0
+        self.goal_reached_flag[envs_idx] = False
+        if self.goal_used_mask is not None and self.goal_used_mask.shape[0] == self.num_envs:
+            self.goal_used_mask[envs_idx] = False
+        self.goal_max_speed[envs_idx] = 0.0
+
+        # ここで p_goal の確率でゴールを持たせる
+        # 例: goal_probability が未設定なら 0.3 (30%) とする
+        self._assign_new_goals(envs_idx)
+        # --------------------------------------------------------------
         if self.env_cfg['send_timeouts']:
             self.extras['time_outs'] = self.time_out_buf
 
@@ -1913,7 +2273,8 @@ class LeggedEnv:
 
 
     def _render_headless(self):
-        if self._recording and len(self._recorded_frames) < 150:
+        should_record = self.enable_recording and self._recording and len(self._recorded_frames) < 150
+        if should_record:
             x, y, z = self.base_pos[0].cpu().numpy()  # Convert the tensor to NumPy
             self.cam_0.set_pose(pos=(x+5.0, y, z+5.5), lookat=(x, y, z+0.5))
             if self.show_camera_:
@@ -1929,6 +2290,8 @@ class LeggedEnv:
                 rgb=True,
             )
     def get_recorded_frames(self):
+        if not self.enable_recording:
+            return None
         if len(self._recorded_frames) >=10:
             frames = self._recorded_frames
             self._recorded_frames = []
@@ -1938,6 +2301,8 @@ class LeggedEnv:
             return None
 
     def start_recording(self, record_internal=True):
+        if not self.enable_recording:
+            return
         if self.show_camera_:
             return
         self._recorded_frames = []
@@ -1948,6 +2313,8 @@ class LeggedEnv:
             self.cam_0.start_recording()
 
     def stop_recording(self, save_path=None):
+        if not self.enable_recording:
+            return
         self._recorded_frames = []
         self._recording = False
         if save_path is not None:
@@ -2159,9 +2526,10 @@ class LeggedEnv:
             )
 
             # ─── GREEN arrow: commanded velocity (rotated to world frame) ─
-            cmd_body = torch.tensor(
-                [*self.commands[env_idx, :2], 0.0],
-                device=self.device, dtype=gs.tc_float
+            # Avoid torch.tensor(list_of_tensors) to prevent copy-construct warning
+            cmd_body = torch.cat(
+                (self.commands[env_idx, :2], torch.zeros(1, device=self.device, dtype=gs.tc_float)),
+                dim=0,
             ).unsqueeze(0)
             cmd_world = transform_by_quat(
                 cmd_body,
@@ -2197,89 +2565,128 @@ class LeggedEnv:
                     color=(1.0, 0.0, 0.0, 0.8)
                 )
 
+            # --- Goal marker & direction (if goal is assigned) -----------------
+            if hasattr(self, "has_goal") and hasattr(self, "goal_pos") and self.has_goal[env_idx]:
+                goal = self.goal_pos[env_idx].detach().cpu()
+                # Marker at goal location
+                self.scene.draw_debug_spheres(
+                    poss=goal.unsqueeze(0),
+                    radius=0.06,
+                    color=(1.0, 0.6, 0.1, 0.9),  # amber
+                )
+                # Arrow from base toward goal (slightly above base to avoid ground)
+                base_pos = self.base_pos[env_idx].detach().cpu()
+                vec_to_goal = goal - base_pos
+                if torch.norm(vec_to_goal) > 1e-4:
+                    lift = torch.tensor(
+                        [0.0, 0.0, 0.15],
+                        device=base_pos.device,
+                        dtype=base_pos.dtype,
+                    )
+                    self.scene.draw_debug_arrow(
+                        pos=base_pos + lift,
+                        vec=vec_to_goal,
+                        radius=0.03,
+                        color=(1.0, 0.4, 0.0, 0.8),  # darker orange
+                    )
+
+        # Visualize height patch for the first rendered env (like a LiDAR grid) if enabled
+        if self.height_patch_enabled and len(self.rendered_envs_idx) > 0:
+            env_idx = self.rendered_envs_idx[0]
+            base_xy = self.base_pos[env_idx, :2]
+            z_grid = self.height_patch_world[env_idx]  # world heights (G,G)
+            x_grid = base_xy[0] + self.height_patch_offsets[..., 0]
+            y_grid = base_xy[1] + self.height_patch_offsets[..., 1]
+            points = torch.stack((x_grid, y_grid, z_grid), dim=-1).reshape(-1, 3).cpu()
+            self.scene.draw_debug_spheres(
+                poss=points,
+                radius=0.015,
+                color=(0.2, 0.8, 1.0, 0.7),  # cyan-ish
+            )
+
 
 
     # ------------ reward functions----------------
 
-    def _reward_tracking_lin_vel(self):
-        # 誤差（二乗和）
-        cmd_xy = self.commands[:, :2]
-        vel_xy = self.base_lin_vel[:, :2]
-        lin_vel_error = torch.sum((cmd_xy - vel_xy)**2, dim=1)
+    # def _reward_tracking_lin_vel(self):
+    #     # 誤差（二乗和）
+    #     cmd_xy = self.commands[:, :2]
+    #     vel_xy = self.base_lin_vel[:, :2]
+    #     lin_vel_error = torch.sum((cmd_xy - vel_xy)**2, dim=1)
 
-        # スケール（従来どおり）
-        cmd_vel_norm = torch.norm(cmd_xy, dim=1)
-        sigma = torch.clamp(
-            cmd_vel_norm,
-            min=self.reward_cfg["tracking_min_sigma"],
-            max=self.reward_cfg["tracking_max_sigma"],
-        )
-        reward_full = torch.exp(-lin_vel_error / (sigma + 1e-8))
+    #     # スケール（従来どおり）
+    #     cmd_vel_norm = torch.norm(cmd_xy, dim=1)
+    #     sigma = torch.clamp(
+    #         cmd_vel_norm,
+    #         min=self.reward_cfg["tracking_min_sigma"],
+    #         max=self.reward_cfg["tracking_max_sigma"],
+    #     )
+    #     reward_full = torch.exp(-lin_vel_error / (sigma + 1e-8))
 
-        # コマンドがゼロなら評価しない（寄与0）
-        eps = 1e-6 #$self.reward_cfg.get("lin_vel_tracking_eps", 1e-6)
-        active = (cmd_vel_norm > eps).float()
-        # return reward_full * active
-        return reward_full
+    #     # コマンドがゼロなら評価しない（寄与0）
+    #     eps = 1e-6 #$self.reward_cfg.get("lin_vel_tracking_eps", 1e-6)
+    #     active = (cmd_vel_norm > eps).float()
+    #     # return reward_full * active
+    #     return reward_full
 
-    def _reward_untracking_lin_vel(self):
-        """
-        目標線形速度 (x,y) からズレるほど大きくなるペナルティ
-        （0=完全一致, 1≒大ズレ）
+    # def _reward_untracking_lin_vel(self):
+    #     """
+    #     目標線形速度 (x,y) からズレるほど大きくなるペナルティ
+    #     （0=完全一致, 1≒大ズレ）
 
-        ガウス形：
-            pen = 1 - exp(-alpha * e^2 / sigma)
+    #     ガウス形：
+    #         pen = 1 - exp(-alpha * e^2 / sigma)
 
-        備考:
-        - sigma: コマンド速度の大きさでスケーリング
-                （低速時は厳しめ、高速時は緩め）
-        - alpha: 鋭さを調整する係数（reward_cfg["tracking_lin_alpha"]）
-        """
-        # 誤差（二乗和）
-        e2 = torch.sum(
-            torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]),
-            dim=1
-        )
+    #     備考:
+    #     - sigma: コマンド速度の大きさでスケーリング
+    #             （低速時は厳しめ、高速時は緩め）
+    #     - alpha: 鋭さを調整する係数（reward_cfg["tracking_lin_alpha"]）
+    #     """
+    #     # 誤差（二乗和）
+    #     e2 = torch.sum(
+    #         torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]),
+    #         dim=1
+    #     )
 
-        # スケール（コマンド速度の大きさ、極小はminで保護）
-        sigma = torch.clamp(
-            torch.norm(self.commands[:, :2], dim=1),
-            min=self.reward_cfg["tracking_min_sigma"],
-            max=self.reward_cfg["tracking_max_sigma"]
-        )
+    #     # スケール（コマンド速度の大きさ、極小はminで保護）
+    #     sigma = torch.clamp(
+    #         torch.norm(self.commands[:, :2], dim=1),
+    #         min=self.reward_cfg["tracking_min_sigma"],
+    #         max=self.reward_cfg["tracking_max_sigma"]
+    #     )
 
-        # 近傍の鋭さ（未設定なら1.0）
-        alpha = self.reward_cfg.get("tracking_lin_alpha", 1.0)
+    #     # 近傍の鋭さ（未設定なら1.0）
+    #     alpha = self.reward_cfg.get("tracking_lin_alpha", 1.0)
 
-        # 0(良)→1(悪) に正規化されたガウスペナルティ
-        return 1.0 - torch.exp(-1.0 * e2 / (sigma + 1e-8))
+    #     # 0(良)→1(悪) に正規化されたガウスペナルティ
+    #     return 1.0 - torch.exp(-1.0 * e2 / (sigma + 1e-8))
 
 
 
-    def _reward_tracking_lin_vel_x(self):
-        """
-        直進方向(x)の速度追従ごほうび。
-        近いほど1、外れるほど0へ（ガウス形）。
-        """
-        # 誤差（二乗）
-        e2 = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
+    # def _reward_tracking_lin_vel_x(self):
+    #     """
+    #     直進方向(x)の速度追従ごほうび。
+    #     近いほど1、外れるほど0へ（ガウス形）。
+    #     """
+    #     # 誤差（二乗）
+    #     e2 = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
 
-        # スケール（コマンドxの絶対値でスケーリング）
-        sigma = torch.clamp(
-            torch.abs(self.commands[:, 0]),
-            min=self.reward_cfg["tracking_min_sigma"],
-            max=self.reward_cfg["tracking_max_sigma"]
-        )
+    #     # スケール（コマンドxの絶対値でスケーリング）
+    #     sigma = torch.clamp(
+    #         torch.abs(self.commands[:, 0]),
+    #         min=self.reward_cfg["tracking_min_sigma"],
+    #         max=self.reward_cfg["tracking_max_sigma"]
+    #     )
 
-        # 鋭さ
-        alpha = self.reward_cfg.get("tracking_lin_alpha_x",
-                self.reward_cfg.get("tracking_lin_alpha", 1.0))
+    #     # 鋭さ
+    #     alpha = self.reward_cfg.get("tracking_lin_alpha_x",
+    #             self.reward_cfg.get("tracking_lin_alpha", 1.0))
 
-        # デッドバンド（任意）：ほぼ0指令時は評価しない
-        deadband = self.reward_cfg.get("lin_cmd_deadband_x", 0.0)
-        mask = (torch.abs(self.commands[:, 0]) > deadband).float()
+    #     # デッドバンド（任意）：ほぼ0指令時は評価しない
+    #     deadband = self.reward_cfg.get("lin_cmd_deadband_x", 0.0)
+    #     mask = (torch.abs(self.commands[:, 0]) > deadband).float()
 
-        return torch.exp(-alpha * e2 / (sigma + 1e-8)) * mask + (1.0 - mask)  # ゲート外は中立=1
+    #     return torch.exp(-alpha * e2 / (sigma + 1e-8)) * mask + (1.0 - mask)  # ゲート外は中立=1
 
     def _reward_untracking_lin_vel_x(self):
         """
@@ -2307,12 +2714,12 @@ class LeggedEnv:
 
 
 
-    def _reward_tracking_ang_vel(self):
-        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-        cmd_sigma = torch.clamp(torch.abs(self.commands[:, 2]),
-                                min=self.reward_cfg["tracking_min_sigma"],
-                                max=self.reward_cfg["tracking_max_sigma"])
-        return torch.exp(-ang_vel_error / cmd_sigma)
+    # def _reward_tracking_ang_vel(self):
+    #     ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+    #     cmd_sigma = torch.clamp(torch.abs(self.commands[:, 2]),
+    #                             min=self.reward_cfg["tracking_min_sigma"],
+    #                             max=self.reward_cfg["tracking_max_sigma"])
+    #     return torch.exp(-ang_vel_error / cmd_sigma)
 
 
     def _reward_untracking_ang_vel(self):
@@ -2339,6 +2746,29 @@ class LeggedEnv:
         return 1.0 - torch.exp(-alpha * e2 / (sigma + 1e-8))
 
 
+    # def _reward_tracking_lin_vel(self):
+    #     # Tracking of linear velocity commands (xy axes)
+    #     lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+    #     # return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+    #     cmd_vel_norm = torch.clamp(torch.norm(self.commands[:, :2], dim=1), min=self.reward_cfg["tracking_min_sigma"], max=self.reward_cfg["tracking_max_sigma"])
+    #     return torch.exp(-lin_vel_error / cmd_vel_norm)
+
+    # def _reward_tracking_ang_vel(self):
+    #     # Tracking of angular velocity commands (yaw)
+    #     ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+    #     # return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
+    #     cmd_vel_norm = torch.clamp(torch.square(self.commands[:, 2]), min=self.reward_cfg["tracking_min_sigma"], max=self.reward_cfg["tracking_max_sigma"])
+    #     return torch.exp(-ang_vel_error / cmd_vel_norm)
+
+    def _reward_tracking_lin_vel(self):
+        # Tracking of linear velocity commands (xy axes)
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_max_sigma"])
+
+    def _reward_tracking_ang_vel(self):
+        # Tracking of angular velocity commands (yaw)
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        return torch.exp(-ang_vel_error / self.reward_cfg["tracking_max_sigma"])
 
     def _reward_roll_penalty(self):
         # Penalize large roll (base_euler[:, 0] is roll in radians)
@@ -2406,12 +2836,12 @@ class LeggedEnv:
         # Sum over those links to get # of collisions per environment
         return collisions.sum(dim=1)
 
-    def _reward_bumper_collision(self):
+    def _reward_head_collision(self):
         """
         Penalize collisions on selected bodies.
         Returns the per-env penalty value as a 1D tensor of shape (n_envs,).
         """
-        undesired_forces = torch.norm(self.contact_forces[:, self.bumper_indices, :], dim=-1)
+        undesired_forces = torch.norm(self.contact_forces[:, self.head_indices, :], dim=-1)
         collisions = (undesired_forces > 0.1).float()  # shape (n_envs, len(...))
         
         # Sum over those links to get # of collisions per environment
@@ -2887,6 +3317,43 @@ class LeggedEnv:
         motion = torch.norm(self.base_lin_vel[:, :2], dim=1) + torch.abs(self.base_ang_vel[:, 2])
         return motion * no_cmd.float()
 
+    def _reward_idle_leg_raise(self):
+        """
+        Penalize keeping any leg raised for longer than 1 second while idle.
+        The timer resets when the leg touches down or a motion command is issued.
+        """
+        no_cmd = (torch.norm(self.commands[:, :2], dim=1) < 0.1) & (torch.abs(self.commands[:, 2]) < 0.1)
+        idle_mask = no_cmd.unsqueeze(1)  # (N,1) for broadcasting
+
+        contact = torch.norm(self.contact_forces[:, self.feet_indices, :3], dim=2) > 1.0  # (N, feet)
+        legs_raised = (~contact) & idle_mask
+
+        # Accumulate raised duration only when idle; reset otherwise.
+        self.idle_leg_raise_duration = torch.where(
+            legs_raised,
+            self.idle_leg_raise_duration + self.dt,
+            torch.zeros_like(self.idle_leg_raise_duration),
+        )
+
+        # Penalty starts after 1 second of continuous raised state.
+        over_duration = torch.clamp(self.idle_leg_raise_duration - 1.0, min=0.0)
+        penalty = over_duration.sum(dim=1)
+        return penalty * no_cmd.float()
+
+    def _reward_all_feet_contact_when_idle(self):
+        # Reward having all feet in contact when no motion is commanded and the robot is upright
+        no_cmd = (torch.norm(self.commands[:, :2], dim=1) < 0.1) & (torch.abs(self.commands[:, 2]) < 0.1)
+        upright = (torch.abs(self.base_euler[:, 0]) < math.radians(30.0)) & (
+            torch.abs(self.base_euler[:, 1]) < math.radians(30.0)
+        )
+        active_mask = no_cmd & upright
+        if not torch.any(active_mask):
+            return torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float)
+
+        contact = torch.norm(self.contact_forces[:, self.feet_indices, :3], dim=2) > 1.0  # (N, feet)
+        all_feet_contact = contact.all(dim=1).float()
+        return all_feet_contact * active_mask.float()
+
 
     def _reward_both_front_feet_airborne(self):
         """
@@ -3006,31 +3473,22 @@ class LeggedEnv:
         return penalty
 
 
-
-    def _reward_leg_cross(self):
+    def _compute_leg_clearance_penalty(self, include_rear=True, return_depth=False):
         """
-        Returns: (N,)  正の値（= ペナルティ量）
-        前提:
-        self.front_feet_pos_base : (N,2,3) in base frame [Left, Right]
-            もし未更新なら self._world_to_base_transform(self.feet_front_pos, self.base_pos, self.base_quat) を使ってください。
-        reward_cfg:
-        hip_width         [m]  : 左右股間隔の代表値 (default 0.18)
-        cross_margin      [m]  : 最低確保したい左右幅 (default 0.05)
-        cross_power             : 幅不足のべき乗 (default 2)
-        cross_soft_gain         : 幅不足(soft)のゲイン (default 1.0)
-        cross_hard_const        : クロス瞬間の定数罰 (default 1.0)
-        cross_hard_gain         : クロス深さのゲイン (default 2.0)
-        side_deadband     [m]   : 中央線越え許容 (default 0.0)
+        Compute lateral-clearance penalty for left/right pairs.
+        Pair ordering is inferred every step (max y = left, min y = right) so it
+        works even if link indices are not sorted.
         """
-        # 座標
-        p = getattr(self, "front_feet_pos_base", None)
-        if p is None:
-            p = self._world_to_base_transform(self.feet_front_pos, self.base_pos, self.base_quat)  # (N,2,3)
+        pairs = []
+        if getattr(self, "front_feet_pos_base", None) is not None:
+            pairs.append(self.front_feet_pos_base)
+        if include_rear and getattr(self, "rear_feet_pos_base", None) is not None:
+            pairs.append(self.rear_feet_pos_base)
 
-        yL = p[:, 0, 1]; yR = p[:, 1, 1]
-        gap = yL - yR                      # 正常: 正、クロス: 負
+        if len(pairs) == 0:
+            zeros = torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float)
+            return (zeros, zeros) if return_depth else zeros
 
-        # ハイパラ
         hip_w   = float(self.reward_cfg.get("hip_width", 0.1))
         margin  = float(self.reward_cfg.get("cross_margin", 0.05))
         power   = int(self.reward_cfg.get("cross_power", 2))
@@ -3038,23 +3496,119 @@ class LeggedEnv:
         c_hard  = float(self.reward_cfg.get("cross_hard_const", 1.0))
         g_hard  = float(self.reward_cfg.get("cross_hard_gain", 2.0))
         deadband = float(self.reward_cfg.get("side_deadband", 0.0))
+        cross_simple = bool(self.reward_cfg.get("cross_simple", False))
         eps = 1e-6
 
-        # 1) 幅不足(soft) ・・・ gap < margin で連続立ち上がり、二乗で強める
-        deficit_m   = F.relu(margin - gap)                  # [m]
-        deficit_nd  = deficit_m / max(hip_w, eps)           # 無次元
-        soft_pen    = g_soft * (deficit_nd ** power)
+        penalties = []
+        depths = []
+        for pair in pairs:
+            y_vals = pair[..., 1]
+            y_left, _ = torch.max(y_vals, dim=1)   # larger y → left
+            y_right, _ = torch.min(y_vals, dim=1)  # smaller y → right
+            gap = y_left - y_right                 # expected positive when not crossing
 
-        # 2) 完全クロス(hard) ・・・ gap<0 の瞬間に定数＋深さ比例の罰
-        cross_flag  = (gap < 0).float()
-        depth_nd    = (-gap / max(hip_w, eps)).clamp(min=0) # 無次元クロス深さ
-        hard_pen    = cross_flag * (c_hard + g_hard * (depth_nd ** power))
+            if cross_simple:
+                # Simple mode: only enforce margin and side (centerline) separation.
+                gap_violation    = F.relu(margin - gap) / max(hip_w, eps)
+                center_pen       = (F.relu(margin - y_left) + F.relu(margin + y_right)) / max(hip_w, eps)
+                penalty = gap_violation + center_pen
+                depth_nd = (-gap / max(hip_w, eps)).clamp(min=0)
+            else:
+                deficit_m   = F.relu(margin - gap)
+                deficit_nd  = deficit_m / max(hip_w, eps)
+                soft_pen    = g_soft * (deficit_nd ** power)
 
-        # 3) 中央線越え（左が y<0、右が y>0）にも無次元で追加
-        center_violation_m = F.relu(deadband - yL) + F.relu(deadband + yR)
-        center_pen         = center_violation_m / max(hip_w, eps)
+                depth_nd    = (-gap / max(hip_w, eps)).clamp(min=0)
+                hard_pen    = (gap < 0).float() * (c_hard + g_hard * (depth_nd ** power))
 
-        return soft_pen + hard_pen + center_pen
+                center_pen  = (F.relu(deadband - y_left) + F.relu(deadband + y_right)) / max(hip_w, eps)
+                penalty = soft_pen + hard_pen + center_pen
+
+            penalties.append(penalty)
+            depths.append(depth_nd)
+
+        penalties = torch.stack(penalties, dim=1).mean(dim=1)
+        max_depth = torch.stack(depths, dim=1).max(dim=1).values
+
+        return (penalties, max_depth) if return_depth else penalties
+
+    def _compute_fore_aft_clearance_penalty(self, return_depth=False):
+        """
+        Fore-aft clearance penalty so front/rear feet stay on their respective
+        sides of the base x-axis and keep a margin to avoid collisions.
+        """
+        front = getattr(self, "front_feet_pos_base", None)
+        rear = getattr(self, "rear_feet_pos_base", None)
+        if front is None or rear is None:
+            zeros = torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float)
+            return (zeros, zeros) if return_depth else zeros
+
+        margin = float(self.reward_cfg.get("fore_margin", self.reward_cfg.get("cross_margin", 0.05)))
+        power = int(self.reward_cfg.get("fore_power", self.reward_cfg.get("cross_power", 2)))
+        g_soft = float(self.reward_cfg.get("fore_soft_gain", self.reward_cfg.get("cross_soft_gain", 1.0)))
+        c_hard = float(self.reward_cfg.get("fore_hard_const", self.reward_cfg.get("cross_hard_const", 1.0)))
+        g_hard = float(self.reward_cfg.get("fore_hard_gain", self.reward_cfg.get("cross_hard_gain", 2.0)))
+        deadband = float(self.reward_cfg.get("fore_deadband", 0.0))
+        eps = 1e-6
+        half_len = max(float(self.body_half_length), eps)
+
+        front_x = front[:, :, 0]
+        rear_x = rear[:, :, 0]
+        front_y = front[:, :, 1]
+        rear_y = rear[:, :, 1]
+
+        # Determine left/right feet on-the-fly to stay robust to link ordering.
+        idx = torch.arange(self.num_envs, device=self.device)
+        front_left_idx = torch.argmax(front_y, dim=1)
+        front_right_idx = 1 - front_left_idx
+        rear_left_idx = torch.argmax(rear_y, dim=1)
+        rear_right_idx = 1 - rear_left_idx
+
+        front_left_x = front_x[idx, front_left_idx]
+        front_right_x = front_x[idx, front_right_idx]
+        rear_left_x = rear_x[idx, rear_left_idx]
+        rear_right_x = rear_x[idx, rear_right_idx]
+
+        gaps = torch.stack(
+            [front_left_x - rear_left_x, front_right_x - rear_right_x], dim=1
+        )  # positive when front is ahead of rear
+
+        deficit_m = F.relu(margin - gaps)
+        deficit_nd = deficit_m / half_len
+        soft_pen = g_soft * (deficit_nd ** power)
+
+        depth_nd = (-gaps / half_len).clamp(min=0)
+        hard_pen = (gaps < 0).float() * (c_hard + g_hard * (depth_nd ** power))
+
+        # Keep each foot on its side of the base x-axis with an optional deadband.
+        center_pen_front = F.relu(deadband - torch.stack([front_left_x, front_right_x], dim=1)) / half_len
+        center_pen_rear = F.relu(deadband + torch.stack([rear_left_x, rear_right_x], dim=1)) / half_len
+
+        penalty = soft_pen + hard_pen + center_pen_front + center_pen_rear
+        max_depth = depth_nd.max(dim=1).values
+
+        penalty = penalty.mean(dim=1)
+        return (penalty, max_depth) if return_depth else penalty
+
+    def _reward_leg_cross(self):
+        """
+        Returns: (N,)  正の値（= ペナルティ量）
+        Uses base-frame foot positions and enforces clearance for both front/rear.
+        See _compute_leg_clearance_penalty for parameter meanings.
+        """
+        penalty, depth = self._compute_leg_clearance_penalty(include_rear=True, return_depth=True)
+        # Keep the latest depth for diagnostics/termination guards.
+        self._last_leg_cross_depth = depth
+        return penalty
+
+    def _reward_leg_cross_fore_aft(self):
+        """
+        Penalizes front/rear feet crossing the base x-axis or encroaching toward
+        each other to avoid fore-aft collisions.
+        """
+        penalty, depth = self._compute_fore_aft_clearance_penalty(return_depth=True)
+        self._last_leg_cross_fore_depth = depth
+        return penalty
 
     def _reward_action_curvature(self):
         """
@@ -3082,3 +3636,88 @@ class LeggedEnv:
         reffort = std_per_joint.sum(dim=1)  # Σ over joint-types
 
         return reffort
+
+    def _reward_stuck_ema(self):
+        """
+        leg_phase を使わず、足先速度＋接触＋本体速度から
+        スイングスタックを検知し、
+        ・即時ペナルティ (stuck_instant)
+        ・履歴ベースの EMA ペナルティ (swing_stuck_ema)
+        の両方を使って罰する。
+        """
+
+        # 1) 足先速度（world frame）
+        #    feet_vel: (N, num_feet, 3)
+        foot_speed = torch.norm(self.feet_vel, dim=2)  # (N, num_feet)
+
+        swing_speed_thresh = self.reward_cfg.get("swing_speed_thresh", 0.4)
+        swing_like = (foot_speed > swing_speed_thresh).float()  # (N, num_feet)
+
+        # 2) 接触（1: 接触、0: 非接触）
+        _, _, contact_mask_f = self._get_feet_forces_and_contact(force_thresh=1.0)  # (N, num_feet)
+
+        # 3) 「コマンドに見合って進んでいない」かどうかを動的に判定
+        #    robot_speed_xy: 実際の水平速度 [m/s]
+        robot_speed_xy = torch.norm(self.base_lin_vel[:, :2], dim=1)  # (N,)
+
+        #    cmd_speed_xy: コマンドの水平速度 [m/s]
+        cmd_speed_xy = torch.norm(self.commands[:, :2], dim=1)       # (N,)
+
+        #    コマンド速度の何割を下回ったら「遅い」とみなすか
+        speed_scale = self.reward_cfg.get("stuck_speed_scale", 0.8)   # fraction of commanded speed
+        speed_min = self.reward_cfg.get("stuck_speed_min_thresh", 0.05)
+
+        # thresh = max(speed_min, cmd_speed_xy * speed_scale)
+        speed_thresh = torch.maximum(
+            torch.as_tensor(speed_min, device=self.device, dtype=gs.tc_float),
+            cmd_speed_xy * speed_scale,
+        )  # (N,)
+
+        low_speed = (robot_speed_xy < speed_thresh).float().unsqueeze(1)  # (N,1)
+
+        # 4) スタック瞬間指標
+        #    「スイングっぽい」かつ「接触している」かつ「進めていない」
+        stuck_raw = swing_like * contact_mask_f * low_speed  # (N, num_feet)
+
+        # 5) 各 env で、どれか 1 足でもスタックしていれば 1 に近づける
+        stuck_instant = stuck_raw.max(dim=1).values  # (N,)
+
+        # 6) EMA 更新
+        #    上昇時は早く、下降時はゆっくり戻る非対称 EMA にすることで
+        #    「引っかかった瞬間はすぐ効き、解除後はゆっくり減衰」させる
+        alpha_up   = self.reward_cfg.get("stuck_ema_alpha_up",   0.9)
+        alpha_down = self.reward_cfg.get("stuck_ema_alpha_down", 0.99)
+
+        rising = stuck_instant > self.swing_stuck_ema  # True: EMA を上げる方向
+        alpha = torch.where(
+            rising,
+            torch.full_like(stuck_instant, alpha_up),
+            torch.full_like(stuck_instant, alpha_down),
+        )
+
+        self.swing_stuck_ema = alpha * self.swing_stuck_ema + (1.0 - alpha) * stuck_instant
+
+        # 7) 小さな値には反応しない（margin）
+        margin = self.reward_cfg.get("stuck_ema_margin", 0.02)
+        ema_term = torch.clamp(self.swing_stuck_ema - margin, min=0.0)  # (N,)
+
+        # 8) 瞬間ペナルティも足す
+        #    → stuck になった瞬間からペナルティが効き始める
+        w_inst = self.reward_cfg.get("stuck_instant_weight", 0.5)
+        instant_term = w_inst * stuck_instant  # (N,)
+
+        penalty = ema_term + instant_term  # (N,)
+
+        # 9) ほぼ静止コマンドのときは罰しない（その場ステイ中の接触は無視）
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)  # (N,)
+        active_cmd = cmd_speed > self.reward_cfg.get("stuck_min_command", 0.05)
+        penalty[~active_cmd] = 0.0
+
+        return penalty
+
+    def _reward_goal_reached(self):
+        rew = torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float)
+        rew[self.goal_reached_flag] = 1.0  # 1回到達ごとに +1 とか
+        # 使い終わったらフラグをクリア
+        self.goal_reached_flag[:] = False
+        return rew

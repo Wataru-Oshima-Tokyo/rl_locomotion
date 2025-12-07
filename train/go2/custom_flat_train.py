@@ -23,19 +23,25 @@ reward_cfg_patch = {
     "reward_scales": {
         "tracking_lin_vel": 1.5,
         "tracking_ang_vel": 0.75,
-        "lin_vel_z": -2.0,
-        "relative_base_height": -1.0,
-        "orientation": -1.0, 
-        "ang_vel_xy": -0.05,
-        "collision": -5.0,
-        "dof_pos_limits": -10.0, #fixed!
+        "lin_vel_z": -5.0,
+        "relative_base_height": -30.0,
+        "orientation": -10.0, #fixed!
+        "ang_vel_xy": -0.05, #fixed!
+        "collision": -10.0, #fixed!
+        "dof_pos_limits": -20.0, #fixed!
         "termination": -30.0,
+        # "front_hip": -0.2,
+        # "rear_hip": -0.5,
+        # "action_rate": -0.01,
+        "dof_acc": -2.5e-7,
+        "powers": -2e-5,
         "feet_contact_forces": -0.0001,
         "default_pose_when_idle": -2.0,
         "feet_stumble": -0.5,
-        # "alive": 0.3,
+        "alive": 0.3,
         "action_curvature": -0.1,
         "effort_symmetry": -0.1,
+        # "leg_cross": -0.1
     },
 }
 

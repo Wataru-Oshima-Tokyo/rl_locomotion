@@ -1,15 +1,25 @@
 # teleop_with_policy.py  ────────────────────────────────────────────────
 import argparse, threading, time, os, pickle, re, torch
 import numpy as np
+from typing import TYPE_CHECKING
 from pynput import keyboard
 import genesis as gs
-from legged_env import LeggedEnv
 from rsl_rl.runners import OnPolicyRunner
+
+if TYPE_CHECKING:
+    from legged_env import LeggedEnv
 
 # ---------- helper -----------------------------------------------------
 def load_last_run(base_dir):
-    latest = sorted(d for d in os.listdir(base_dir)
-                    if os.path.isdir(f"{base_dir}/{d}"))[-1]
+    if not os.path.isdir(base_dir):
+        raise FileNotFoundError(f"No runs found: directory '{base_dir}' does not exist.")
+
+    candidates = [d for d in os.listdir(base_dir)
+                  if os.path.isdir(f"{base_dir}/{d}")]
+    if not candidates:
+        raise FileNotFoundError(f"No runs found under '{base_dir}'.")
+
+    latest = sorted(candidates)[-1]
     return f"{base_dir}/{latest}"
 
 def load_cfgs(exp_name):
@@ -48,6 +58,8 @@ def main():
     args=ap.parse_args()
 
     gs.init()
+    # Delay import until after gs.init()
+    from legged_env import LeggedEnv
     (env_cfg,obs_cfg,noise_cfg,reward_cfg,command_cfg,
      train_cfg,terrain_cfg), run_dir = load_cfgs(args.exp_name)
     reward_cfg["reward_scales"] = {}
@@ -55,9 +67,10 @@ def main():
     # train_cfg["policy"]["class_name"] = "ActorCriticRecurrent"      # or "ActorCriticRecurrent"
     # train_cfg["algorithm"]["class_name"] = "PPO"          # ← add this line
     command_cfg["curriculum"] = False
+    env_cfg["randomize_rot"] = False
     env = LeggedEnv(args.num_envs, env_cfg, obs_cfg, noise_cfg,
                     reward_cfg, command_cfg, terrain_cfg,
-                    show_viewer_=True, eval_=True, control_=True, show_camera_=True)
+                    show_viewer_=True, eval_=True, control_=True, show_camera_=False)
 
     # --- load trained actor ---
     runner = OnPolicyRunner(env, train_cfg, run_dir, device="cuda:0")

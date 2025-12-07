@@ -2119,9 +2119,10 @@ class LeggedEnv:
             )
 
             # ─── GREEN arrow: commanded velocity (rotated to world frame) ─
-            cmd_body = torch.tensor(
-                [*self.commands[env_idx, :2], 0.0],
-                device=self.device, dtype=gs.tc_float
+            # Avoid torch.tensor(list_of_tensors) to prevent copy-construct warning
+            cmd_body = torch.cat(
+                (self.commands[env_idx, :2], torch.zeros(1, device=self.device, dtype=gs.tc_float)),
+                dim=0,
             ).unsqueeze(0)
             cmd_world = transform_by_quat(
                 cmd_body,
@@ -2161,118 +2162,49 @@ class LeggedEnv:
 
     # ------------ reward functions----------------
 
+    # def _reward_tracking_lin_vel(self):
+    #     # 誤差（二乗和）
+    #     cmd_xy = self.commands[:, :2]
+    #     vel_xy = self.base_lin_vel[:, :2]
+    #     lin_vel_error = torch.sum((cmd_xy - vel_xy)**2, dim=1)
+
+    #     # スケール（従来どおり）
+    #     cmd_vel_norm = torch.norm(cmd_xy, dim=1)
+    #     sigma = torch.clamp(
+    #         cmd_vel_norm,
+    #         min=self.reward_cfg["tracking_min_sigma"],
+    #         max=self.reward_cfg["tracking_max_sigma"],
+    #     )
+    #     reward_full = torch.exp(-lin_vel_error / (sigma + 1e-8))
+
+    #     # コマンドがゼロなら評価しない（寄与0）
+    #     eps = 1e-6 #$self.reward_cfg.get("lin_vel_tracking_eps", 1e-6)
+    #     active = (cmd_vel_norm > eps).float()
+    #     # return reward_full * active
+    #     return reward_full
+
+
+
+    # def _reward_tracking_ang_vel(self):
+    #     ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+    #     cmd_sigma = torch.clamp(torch.abs(self.commands[:, 2]),
+    #                             min=self.reward_cfg["tracking_min_sigma"],
+    #                             max=self.reward_cfg["tracking_max_sigma"])
+    #     return torch.exp(-ang_vel_error / cmd_sigma)
+
     def _reward_tracking_lin_vel(self):
-        # 誤差（二乗和）
-        cmd_xy = self.commands[:, :2]
-        vel_xy = self.base_lin_vel[:, :2]
-        lin_vel_error = torch.sum((cmd_xy - vel_xy)**2, dim=1)
-
-        # スケール（従来どおり）
-        cmd_vel_norm = torch.norm(cmd_xy, dim=1)
-        sigma = torch.clamp(
-            cmd_vel_norm,
-            min=self.reward_cfg["tracking_min_sigma"],
-            max=self.reward_cfg["tracking_max_sigma"],
-        )
-        reward_full = torch.exp(-lin_vel_error / (sigma + 1e-8))
-
-        # コマンドがゼロなら評価しない（寄与0）
-        eps = 1e-6 #$self.reward_cfg.get("lin_vel_tracking_eps", 1e-6)
-        active = (cmd_vel_norm > eps).float()
-        # return reward_full * active
-        return reward_full
-
-    def _reward_untracking_lin_vel(self):
-        """
-        目標線形速度 (x,y) からズレるほど大きくなるペナルティ
-        （0=完全一致, 1≒大ズレ）
-
-        ガウス形：
-            pen = 1 - exp(-alpha * e^2 / sigma)
-
-        備考:
-        - sigma: コマンド速度の大きさでスケーリング
-                （低速時は厳しめ、高速時は緩め）
-        - alpha: 鋭さを調整する係数（reward_cfg["tracking_lin_alpha"]）
-        """
-        # 誤差（二乗和）
-        e2 = torch.sum(
-            torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]),
-            dim=1
-        )
-
-        # スケール（コマンド速度の大きさ、極小はminで保護）
-        sigma = torch.clamp(
-            torch.norm(self.commands[:, :2], dim=1),
-            min=self.reward_cfg["tracking_min_sigma"],
-            max=self.reward_cfg["tracking_max_sigma"]
-        )
-
-        # 近傍の鋭さ（未設定なら1.0）
-        alpha = self.reward_cfg.get("tracking_lin_alpha", 1.0)
-
-        # 0(良)→1(悪) に正規化されたガウスペナルティ
-        return 1.0 - torch.exp(-1.0 * e2 / (sigma + 1e-8))
-
-
-
-    def _reward_tracking_lin_vel_x(self):
-        """
-        直進方向(x)の速度追従ごほうび。
-        近いほど1、外れるほど0へ（ガウス形）。
-        """
-        # 誤差（二乗）
-        e2 = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
-
-        # スケール（コマンドxの絶対値でスケーリング）
-        sigma = torch.clamp(
-            torch.abs(self.commands[:, 0]),
-            min=self.reward_cfg["tracking_min_sigma"],
-            max=self.reward_cfg["tracking_max_sigma"]
-        )
-
-        # 鋭さ
-        alpha = self.reward_cfg.get("tracking_lin_alpha_x",
-                self.reward_cfg.get("tracking_lin_alpha", 1.0))
-
-        # デッドバンド（任意）：ほぼ0指令時は評価しない
-        deadband = self.reward_cfg.get("lin_cmd_deadband_x", 0.0)
-        mask = (torch.abs(self.commands[:, 0]) > deadband).float()
-
-        return torch.exp(-alpha * e2 / (sigma + 1e-8)) * mask + (1.0 - mask)  # ゲート外は中立=1
-
-    def _reward_untracking_lin_vel_x(self):
-        """
-        直進方向(x)の非追従ペナルティ。
-        一致で0、大ズレで1へ（ガウス形ペナルティ）。
-        """
-        e2 = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
-
-        sigma = torch.clamp(
-            torch.abs(self.commands[:, 0]),
-            min=self.reward_cfg["tracking_min_sigma"],
-            max=self.reward_cfg["tracking_max_sigma"]
-        )
-
-        alpha = self.reward_cfg.get("tracking_lin_alpha_x",
-                self.reward_cfg.get("tracking_lin_alpha", 1.0))
-
-        deadband = self.reward_cfg.get("lin_cmd_deadband_x", 0.0)
-        mask = (torch.abs(self.commands[:, 0]) > deadband).float()
-
-        # 0(良)→1(悪) に正規化されたガウスペナルティ
-        pen = 1.0 - torch.exp(-alpha * e2 / (sigma + 1e-8))
-        return pen * mask  # ゲート外は0（評価しない）
-
-
-
+        # Tracking of linear velocity commands (xy axes)
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        # return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+        cmd_vel_norm = torch.clamp(torch.norm(self.commands[:, :2], dim=1), min=self.reward_cfg["tracking_min_sigma"], max=self.reward_cfg["tracking_max_sigma"])
+        return torch.exp(-lin_vel_error / cmd_vel_norm)
 
     def _reward_tracking_ang_vel(self):
+        # Tracking of angular velocity commands (yaw)
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-        cmd_sigma = torch.clamp(torch.abs(self.commands[:, 2]),
-                                min=self.reward_cfg["tracking_min_sigma"],
-                                max=self.reward_cfg["tracking_max_sigma"])
-        return torch.exp(-ang_vel_error / cmd_sigma)
+        # return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
+        cmd_vel_norm = torch.clamp(torch.square(self.commands[:, 2]), min=self.reward_cfg["tracking_min_sigma"], max=self.reward_cfg["tracking_max_sigma"])
+        return torch.exp(-ang_vel_error / cmd_vel_norm)
 
 
     def _reward_untracking_ang_vel(self):

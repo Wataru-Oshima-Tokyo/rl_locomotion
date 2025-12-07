@@ -23,13 +23,13 @@ scene = gs.Scene(
 
 ########################## エンティティ ##########################
 
-subterrain_size = 12.0
-horizontal_scale = 0.25
+subterrain_size = 4.0
+horizontal_scale = 0.05
 vertical_scale = 0.005
 cols = 1
 rows = 1
 n_subterrains=(cols, rows)
-terrain_types = ["pyramid_down_stairs_terrain"] # 
+terrain_types = ["pyramid_shallow_down_stairs_terrain"] # 
 grid = [[None for _ in range(cols)] for _ in range(rows)]
 grid[0][0] = terrain_types[0]
 # Calculate the total width and height of the terrain
@@ -40,25 +40,25 @@ total_height =(rows)* subterrain_size
 center_x = total_width / 2
 center_y = total_height / 2
 
-# terrain  = gs.morphs.Terrain(
-#     pos=(-center_x, -center_y ,0),
-#     subterrain_size=(subterrain_size, subterrain_size),
-#     n_subterrains=n_subterrains,
-#     horizontal_scale=horizontal_scale,
-#     vertical_scale=vertical_scale,
-#     subterrain_types=grid
-# )
-# scene.add_entity(terrain)
+terrain  = gs.morphs.Terrain(
+    pos=(-center_x, -center_y ,0),
+    subterrain_size=(subterrain_size, subterrain_size),
+    n_subterrains=n_subterrains,
+    horizontal_scale=horizontal_scale,
+    vertical_scale=vertical_scale,
+    subterrain_types=grid
+)
+scene.add_entity(terrain)
 # go2 = scene.add_entity(
 #     gs.morphs.MJCF(
 #         file  = 'urdf/luvbit/luvbit_prototype00.urdf',
 #     ),
 # )
-base_init = [0.0, 0.0, 0.3]
-pos_base_init = torch.tensor(base_init, device="cuda:0")
-base_quat = [1.0, 0.0, 0.0, 0.0]
-base_init_quat = torch.tensor(base_quat,  device="cuda:0")
-scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+# base_init = [0.0, 0.0, 0.3]
+# pos_base_init = torch.tensor(base_init, device="cuda:0")
+# base_quat = [1.0, 0.0, 0.0, 0.0]
+# base_init_quat = torch.tensor(base_quat,  device="cuda:0")
+# scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
 # robot= scene.add_entity(
 #     gs.morphs.URDF(
 #         file='urdf/luvbit/urdf/luvbit_prototype.urdf',
@@ -68,11 +68,11 @@ scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
 #     ),
 # )
 
-robot = scene.add_entity(
-    gs.morphs.MJCF(
-        file  = 'xml/luvBit/luvBit.xml',
-    ),
-)
+# robot = scene.add_entity(
+#     gs.morphs.MJCF(
+#         file  = 'xml/luvBit/luvBit.xml',
+#     ),
+# )
 
 ########################## ビルド ##########################
 scene.build()

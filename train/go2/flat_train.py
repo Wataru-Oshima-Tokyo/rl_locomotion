@@ -16,38 +16,42 @@ env_cfg_patch = {
     "self_collision": False,
     "randomize_rot": True,
     "base_init_pos": [0.0, 0.0, 0.45],
-    # "termination_if_roll_greater_than": 60,
-    # "termination_if_pitch_greater_than": 90,
+    'max_push_vel_xy': 1.5,
+    "pitch_range": [-180, 180],  # degrees
+    "roll_range": [-180, 180],
     "angle_termination_duration": 5.0, #seconds
 }
 
 reward_cfg_patch = {
-    "soft_dof_pos_limit": 1.0,
+    "soft_dof_pos_limit": 0.9,
     "reward_scales": {
-        "tracking_lin_vel": 1.5,
-        "tracking_ang_vel": 0.75,
+        "tracking_lin_vel": 1.5, #1.5
+        "tracking_ang_vel": 0.75, #0.75
+        "untracking_ang_vel": -1.0,
         "lin_vel_z": -5.0,
-        "relative_base_height": -30.0,
-        "orientation": -10.0, #fixed!
+        "relative_base_height": -50.0,
+        "orientation": -0.1, #fixed!
         "ang_vel_xy": -0.05, #fixed!
         "collision": -10.0, #fixed!
         "dof_pos_limits": -20.0, #fixed!
         "termination": -30.0,
-        "front_hip": -0.2,
-        "rear_hip": -0.5,
+        "dof_acc": -2.5e-7,
         "feet_contact_forces": -0.0001,
-        "default_pose_when_idle": -2.0,
+        "default_pose_when_idle": -3.0,
+        "all_feet_contact_when_idle": 1.0,
         "feet_stumble": -0.5,
-        "alive": 0.3,
-        "action_curvature": -0.1,
-        "effort_symmetry": -0.1,
+        "alive": 0.5,
+        "action_curvature": -0.02,
+        "effort_symmetry": -0.05,
+        "leg_cross": -5.0,
+        "leg_cross_fore_aft": -5.0,
     },
 }
 
 
 
 terrain_cfg_patch = {
-    "terrain_type": "single_step", #plane #single_step
+    "terrain_type": "plane", #plane #single_step
 }
 
 
@@ -55,8 +59,11 @@ command_cfg_patch = {
     "num_commands": 3,
     "curriculum": False,
     "curriculum_iteration_threshold": 2000,
-    "mean_reward_threshold": 22,
-    "lin_vel_x_range": [-1.0, 1.0],
+    "mean_reward_threshold": 20,
+    "goal_probability": 0.0,
+    "enable_stop_commands": True,
+    "stop_command_probability": 0.5,
+    "lin_vel_x_range": [-1.5, 1.5],
     "lin_vel_y_range": [-0.5, 0.5],
     "ang_vel_range": [-1.0, 1.0],
 }
@@ -74,4 +81,4 @@ CFG_PATCHES = (
 )
 
 if __name__ == "__main__":
-    train_main(cfg_patches=CFG_PATCHES, default_exp_name="go2_walking")
+    train_main(cfg_patches=CFG_PATCHES, default_exp_name="go2_walking", default_max_iterations=5000)

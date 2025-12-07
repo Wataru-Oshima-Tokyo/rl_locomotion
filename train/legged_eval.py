@@ -1,23 +1,32 @@
 import argparse
 import os
 import pickle
+from typing import TYPE_CHECKING
 
 import torch
-from legged_env import LeggedEnv
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 import copy
 import re
 
+if TYPE_CHECKING:
+    from legged_env import LeggedEnv
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="go2_walking")
     parser.add_argument("--ckpt", type=int, default=100)
+    parser.add_argument("--export", action="store_true", help="Export policy artifacts (TorchScript).")
+    parser.add_argument("--export-onnx", action="store_true", help="Export the loaded policy to ONNX (CPU).")
+    parser.add_argument("--onnx-path", type=str, default=None, help="Override ONNX export path.")
+    parser.add_argument("--onnx-opset", type=int, default=17, help="ONNX opset version to use.")
     args = parser.parse_args()
 
     gs.init()
+    # Delayed import to ensure Genesis is initialized first.
+    from legged_env import LeggedEnv
 
     log_dir = f"logs/{args.exp_name}"
     # Get all subdirectories in the base log directory
@@ -65,8 +74,7 @@ def main():
     # runner.load(resume_path)
     policy = runner.get_inference_policy(device="cuda:0")
     # export policy as a jit module (used to run it from C++)
-    EXPORT_POLICY = True
-    if EXPORT_POLICY:
+    if args.export:
         # 保存先パスを作成
         save_dir = os.path.join(log_dir, 'exported', 'policies')
         os.makedirs(save_dir, exist_ok=True)
@@ -115,6 +123,44 @@ def main():
         else:
             print("This version does not support this network architecture.")
             print("Could not save policy...")
+
+    # Optional: export to ONNX for CPU-only inference (can be requested independently)
+    if True:
+        save_dir = os.path.join(log_dir, 'exported', 'policies')
+        os.makedirs(save_dir, exist_ok=True)
+
+        class OnnxPolicyWrapper(torch.nn.Module):
+            def __init__(self, actor_module: torch.nn.Module, normalizer: torch.nn.Module):
+                super().__init__()
+                self.normalizer = normalizer
+                self.actor = actor_module
+
+            def forward(self, obs: torch.Tensor) -> torch.Tensor:
+                obs = self.normalizer(obs)
+                return self.actor(obs)
+
+        # Deepcopy to detach from training runner and force everything to CPU
+        actor_cpu = copy.deepcopy(runner.alg.actor_critic.actor).to("cpu").eval()
+        normalizer_cpu = copy.deepcopy(runner.obs_normalizer).to("cpu").eval()
+        wrapper = OnnxPolicyWrapper(actor_cpu, normalizer_cpu).cpu().eval()
+
+        onnx_path = args.onnx_path or os.path.join(save_dir, "policy_mlp.onnx")
+        dummy_obs = torch.zeros(1, obs_cfg["num_obs"], dtype=torch.float32, device="cpu")
+        export_kwargs = dict(
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={"obs": {0: "batch"}, "actions": {0: "batch"}},
+            opset_version=args.onnx_opset,
+            do_constant_folding=True,
+        )
+        try:
+            torch.onnx.export(wrapper, dummy_obs, onnx_path, dynamo=True, **export_kwargs)
+            print(f"Exported policy to ONNX with dynamo exporter: {onnx_path}")
+        except ModuleNotFoundError as e:
+            # onnxscript not installed; fall back to legacy exporter
+            print(f"onnxscript not found ({e}); falling back to legacy torch.onnx.export without dynamo.")
+            torch.onnx.export(wrapper, dummy_obs, onnx_path, dynamo=False, **export_kwargs)
+            print(f"Exported policy to ONNX with legacy exporter: {onnx_path}")
 
     obs, _ = env.reset()
     with torch.no_grad():
