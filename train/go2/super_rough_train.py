@@ -69,8 +69,8 @@ terrain_cfg_patch = {
         "pyramid_sloped_terrain" : {"probability": 0.1},
         # "discrete_obstacles_terrain" : {"probability": 0.1},
         # "pyramid_shallow_down_stairs_terrain" : {"probability": 0.2},
-        "pyramid_shallow_up_stairs_terrain" : {"probability": 0.2},
         "pyramid_up_stairs_terrain" : {"probability": 0.2},
+        "pyramid_up_stairs_terrain_ssw" : {"probability": 0.2},
     }
 }
 

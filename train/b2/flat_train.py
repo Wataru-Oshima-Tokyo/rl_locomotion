@@ -19,8 +19,8 @@ env_cfg_patch = {
     "pitch_range": [-180, 180],  # degrees
     "roll_range": [-180, 180],
     "angle_termination_duration": 5.0, #seconds
-    'foot_randomize_friction': True,
-    'foot_friction_range': [4.5, 5.5],
+    # 'foot_randomize_friction': True,
+    # 'foot_friction_range': [4.5, 5.5],
 }
 
 reward_cfg_patch = {

@@ -108,7 +108,7 @@ def _export_onnx(
 
 def main():
     parser = argparse.ArgumentParser(description="Export a trained policy checkpoint to ONNX without running simulation.")
-    parser.add_argument("-e", "--exp_name", type=str, default="go2_walking", help="Experiment name under logs/")
+    parser.add_argument("-e", "--exp_name", type=str, default="b2_walking", help="Experiment name under logs/")
     parser.add_argument("--ckpt", type=int, default=None, help="Checkpoint number (e.g., 100). Defaults to latest.")
     parser.add_argument("--log-root", type=str, default="logs", help="Root directory containing experiment logs.")
     parser.add_argument("--onnx-path", type=str, default=None, help="Output ONNX path. Defaults to logs/.../exported/policies/policy_mlp.onnx")

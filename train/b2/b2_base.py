@@ -200,7 +200,7 @@ def get_cfgs():
         'motor_randomize_friction': True,
         'motor_friction_range': [0.05, 1.5],
         'foot_randomize_friction': True,
-        'foot_friction_range': [0.05, 1.5],
+        'foot_friction_range': [0.05, 6.0],
         'randomize_base_mass': True,
         'added_mass_range': [-1., 6.],
         'randomize_com_displacement': True,
@@ -376,8 +376,8 @@ def train_main(
 ):
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default=default_exp_name)
-    parser.add_argument("-B", "--num_envs", type=int, default=8192) #10000 8192
-    parser.add_argument("--max_iterations", type=int, default=10000)
+    parser.add_argument("-B", "--num_envs", type=int, default=default_num_envs) #10000 8192
+    parser.add_argument("--max_iterations", type=int, default=default_max_iterations)
     parser.add_argument("--resume", action="store_true", help="Resume from the latest checkpoint if this flag is set")
     parser.add_argument("--show_viewer", action="store_true", help="Wether to visualize simulation env")
     parser.add_argument("--ckpt", type=int, default=0)

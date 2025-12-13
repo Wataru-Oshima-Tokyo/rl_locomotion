@@ -53,8 +53,8 @@ class KeyboardDevice:
 # ---------- main -------------------------------------------------------
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument("-e","--exp_name",default="go2_walking")
-    ap.add_argument("-n","--num_envs",type=int,default=1)
+    ap.add_argument("-e","--exp_name",default="b2_walking")
+    ap.add_argument("-n","--num_envs",type=int,default=2)
     args=ap.parse_args()
 
     gs.init()
@@ -67,7 +67,8 @@ def main():
     # train_cfg["policy"]["class_name"] = "ActorCriticRecurrent"      # or "ActorCriticRecurrent"
     # train_cfg["algorithm"]["class_name"] = "PPO"          # ← add this line
     command_cfg["curriculum"] = False
-    env_cfg["randomize_rot"] = False
+    command_cfg["goal_probability"] = 1.0
+    env_cfg["randomize_rot"] = True
     env = LeggedEnv(args.num_envs, env_cfg, obs_cfg, noise_cfg,
                     reward_cfg, command_cfg, terrain_cfg,
                     show_viewer_=True, eval_=True, control_=True, show_camera_=False)

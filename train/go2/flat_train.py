@@ -20,6 +20,7 @@ env_cfg_patch = {
     "pitch_range": [-180, 180],  # degrees
     "roll_range": [-180, 180],
     "angle_termination_duration": 5.0, #seconds
+    'foot_friction_range': [0.05, 2.0]
 }
 
 reward_cfg_patch = {
@@ -27,7 +28,6 @@ reward_cfg_patch = {
     "reward_scales": {
         "tracking_lin_vel": 1.5, #1.5
         "tracking_ang_vel": 0.75, #0.75
-        "untracking_ang_vel": -1.0,
         "lin_vel_z": -5.0,
         "relative_base_height": -50.0,
         "orientation": -0.1, #fixed!
@@ -41,7 +41,7 @@ reward_cfg_patch = {
         "all_feet_contact_when_idle": 1.0,
         "feet_stumble": -0.5,
         "alive": 0.5,
-        "action_curvature": -0.02,
+        "action_curvature": -0.05,
         "effort_symmetry": -0.05,
         "leg_cross": -5.0,
         "leg_cross_fore_aft": -5.0,
@@ -59,13 +59,13 @@ command_cfg_patch = {
     "num_commands": 3,
     "curriculum": False,
     "curriculum_iteration_threshold": 2000,
-    "mean_reward_threshold": 20,
+    "mean_reward_threshold": 21,
     "goal_probability": 0.0,
     "enable_stop_commands": True,
-    "stop_command_probability": 0.5,
-    "lin_vel_x_range": [-1.5, 1.5],
+    "stop_command_probability": 0.1,
+    "lin_vel_x_range": [-2.0, 2.0],
     "lin_vel_y_range": [-0.5, 0.5],
-    "ang_vel_range": [-1.0, 1.0],
+    "ang_vel_range": [-1.5, 1.5],
 }
 
 

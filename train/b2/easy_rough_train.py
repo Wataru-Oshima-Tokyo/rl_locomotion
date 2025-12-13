@@ -17,14 +17,18 @@ env_cfg_patch = {
     "pitch_range": [-180, 180],  # degrees
     "roll_range": [-180, 180],
     "termination_if_relative_height_lower_than": 0.18,
-    "termination_duration": 5.0
+    "termination_duration": 5.0,
+    # 'foot_randomize_friction': True,
+    # 'foot_friction_range': [4.5, 5.5]
 }
 
 reward_cfg_patch = {
     "soft_dof_pos_limit": 0.9,
     "reward_scales": {
         "tracking_lin_vel": 1.5,
+        "untracking_lin_vel_x": -10.0,
         "tracking_ang_vel": 0.75,
+        "untracking_ang_vel": -3.0,
         "lin_vel_z": -2.0,
         "relative_base_height": -10.0,
         "orientation": -0.1, #fixed!

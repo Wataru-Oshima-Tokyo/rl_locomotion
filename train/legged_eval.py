@@ -39,7 +39,7 @@ def main():
     reward_cfg["reward_scales"] = {}
     # train_cfg["policy"]["class_name"] = "ActorCritic"      # or "ActorCriticRecurrent"
     # train_cfg["algorithm"]["class_name"] = "PPO"          # ← add this line
-    env_cfg["randomize_rot"] = False
+    env_cfg["randomize_rot"] = True
     command_cfg["curriculum"] = False
     env = LeggedEnv(
         num_envs=1,

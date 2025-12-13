@@ -56,8 +56,8 @@ def main():
     center_y = total_height / 2
 
     grid = [[None for _ in range(m)] for _ in range(n)]
-    grid[0][0] = "shallow_stamble_terrain"
-    grid[0][1] = "shallow_blocky_terrain"
+    grid[0][0] = "pyramid_overhang_stairs_terrain"
+    grid[0][1] = "pyramid_overhang_stairs_terrain"
     # grid[0][2] = "shallow_discrete_obstacles_terrain"
     grid[1][0] = "pyramid_sloped_terrain"
     grid[1][1] = "pyramid_down_sloped_terrain"

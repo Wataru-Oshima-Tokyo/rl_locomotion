@@ -275,7 +275,7 @@ def get_cfgs():
     reward_cfg = {
         "tracking_min_sigma": 0.05,
         "tracking_max_sigma": 0.25,
-        "base_height_target": 0.36,
+        "base_height_target": 0.38,
         "effort_ema_alpha": 0.975,
         "relative_base_height_target": 0.38,
         "step_period": 1.0, #0.8

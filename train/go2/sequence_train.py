@@ -52,19 +52,21 @@ def run_stage(title: str, cmd: List[str]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Run B2 flat -> easy_rough -> rough training sequentially.")
-    parser.add_argument("--exp_name", default="b2_walking", help="Experiment name forwarded to each stage.")
+    parser.add_argument("--exp_name", default="go2_walking", help="Experiment name forwarded to each stage.")
     parser.add_argument("-B", "--num_envs", type=int, default=8192, help="Number of envs forwarded to each stage.")
-    parser.add_argument("--flat_iters", type=int, default=1500, help="Max iterations for flat_train.py.")
-    parser.add_argument("--easy_iters", type=int, default=3000, help="Max iterations for easy_rough_train.py.")
-    parser.add_argument("--rough_iters", type=int, default=10000, help="Max iterations for rough_train.py.")
+    parser.add_argument("--flat_iters", type=int, default=2000, help="Max iterations for flat_train.py.")
+    parser.add_argument("--easy_iters", type=int, default=5000, help="Max iterations for easy_rough_train.py.")
+    parser.add_argument("--rough_iters", type=int, default=5000, help="Max iterations for rough_train.py.")
+    parser.add_argument("--super_rough_iters", type=int, default=5000, help="Max iterations for rough_train.py.")
+    parser.add_argument("--stop_iters", type=int, default=3000, help="Max iterations for rough_train.py.")
     parser.add_argument(
         "--start_stage",
-        choices=["flat", "easy_rough", "rough"],
+        choices=["flat", "easy_rough", "rough", "super_rough", "stop"],
         default="flat",
         help="Start from this stage (useful if you already finished earlier ones).",
     )
     parser.add_argument(
-        "--resume_after_first",
+        "--resume_first",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Resume from the latest checkpoint for every stage after the first one you run.",
@@ -77,9 +79,11 @@ def main():
     args = parser.parse_args()
 
     stage_order = [
-        ("flat", "flat_train.py", args.flat_iters),
+        # ("flat", "flat_train.py", args.flat_iters),
         ("easy_rough", "easy_rough_train.py", args.easy_iters),
         ("rough", "rough_train.py", args.rough_iters),
+        ("rough", "super_rough.py", args.super_rough_iters),
+        ("stop", "stop_train.py", args.stop_iters),
     ]
 
     start_idx = next(i for i, (name, _, _) in enumerate(stage_order) if name == args.start_stage)
@@ -89,7 +93,7 @@ def main():
 
     for idx, (name, script, iters) in enumerate(stages_to_run):
         if idx == 0:
-            resume_flag = args.resume_after_first
+            resume_flag = args.resume_first
         else:
             resume_flag = True
         cmd = build_cmd(script, iters, args.exp_name, args.num_envs, resume_flag, extra_args)
